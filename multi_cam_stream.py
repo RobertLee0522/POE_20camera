@@ -209,8 +209,12 @@ class CameraThread(QThread):
                 coverage_pct = 0.0
 
                 if do_sub:
+                    # 縮小影像以節省小電腦/無GPU環境下的 CPU 資源，解決畫面卡頓問題
+                    proc_w, proc_h = 640, 480
+                    frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
+
                     if self.use_cuda:
-                        gpu_frame.upload(frame_gray)
+                        gpu_frame.upload(frame_gray_small)
                         gpu_gray = gaussian_filter.apply(gpu_frame)
                         gpu_gray.convertTo(cv2.CV_32F, gpu_gray_f32)
                         if not is_bg_initialized:
@@ -224,7 +228,7 @@ class CameraThread(QThread):
                             gpu_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
                         thresh_res = gpu_thresh.download()
                     else:
-                        gray = cv2.GaussianBlur(frame_gray, (21, 21), 0)
+                        gray = cv2.GaussianBlur(frame_gray_small, (21, 21), 0)
                         if self.bg_frame is None or self.bg_frame.shape != gray.shape:
                             self.bg_frame = gray.copy().astype("float")
                         cv2.accumulateWeighted(gray, self.bg_frame, 0.01)
@@ -338,6 +342,7 @@ class CameraWidget(QFrame):
         self._alert_active = False
         self._fullscreen_dlg: FullscreenDialog | None = None
         self._last_bgr: np.ndarray | None = None
+        self._last_frame_time = 0.0
         self._setup_ui()
 
     # ─────────────────────────────────────────────────────
@@ -394,6 +399,12 @@ class CameraWidget(QFrame):
         self.res_lbl.setStyleSheet(
             "color:#668899; font-size:12px; qproperty-alignment:AlignRight;")
         bar.addWidget(self.res_lbl)
+
+        # FPS 標籤
+        self.fps_lbl = QLabel("FPS: --")
+        self.fps_lbl.setFixedWidth(55)
+        self.fps_lbl.setStyleSheet("color:#ffccaa; font-size:12px; font-weight:bold;")
+        bar.addWidget(self.fps_lbl)
 
         # 覆蓋率標籤
         cov_icon = QLabel("▣")
@@ -584,6 +595,12 @@ class CameraWidget(QFrame):
     #  影像更新
     # ─────────────────────────────────────────────────────
     def update_frames(self, bgr: np.ndarray, diff: np.ndarray, coverage: float):
+        current_t = time.time()
+        if self._last_frame_time > 0:
+            fps = 1.0 / max(current_t - self._last_frame_time, 0.001)
+            self.fps_lbl.setText(f"FPS: {fps:.1f}")
+        self._last_frame_time = current_t
+
         self._last_bgr = bgr
 
         # 主畫面
@@ -633,6 +650,8 @@ class CameraWidget(QFrame):
         self.orig_lbl.setPixmap(QPixmap())
         self.diff_lbl.setVisible(False)
         self.res_lbl.setText("----×----")
+        self.fps_lbl.setText("FPS: --")
+        self._last_frame_time = 0.0
         self.status_lbl.setText("●")
         self.status_lbl.setStyleSheet("color:#cc3333; font-size:16px;")
         self.status_lbl.setToolTip("已停止")
