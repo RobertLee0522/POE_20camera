@@ -1,7 +1,11 @@
 """
 multi_cam_stream.py
 ====================
-V4.0.0 重新佈局：
+V4.0.1 修正：
+  - 影像相減背景模型改為靜態凍結（解決長時間覆蓋率漂移問題）
+  - CUDA 路徑同步凍結背景（移除 addWeighted 持續學習）
+  - 靈敏度滑桿範圍改為 1~100，預設值 5
+  - 新增「重設背景」按鈕（每個 CameraWidget 工具列）
   - 每頁 2 台相機（左右並排），共 10 頁，支援最多 20 台 POE 相機
   - 字體全面放大（13px 基礎，工具列 14px）
   - 工具列高度 32px，按鈕清晰易點按
@@ -11,7 +15,7 @@ V4.0.0 重新佈局：
   - CPU / CUDA 雙模式運算引擎
   - 自動偵測 GigE / USB3 Vision 相機並顯示型號+IP
 
-作者：Robert Lee  版本：V4.0.0
+作者：Robert Lee  版本：V4.0.1
 """
 
 import sys
@@ -130,27 +134,47 @@ class CameraThread(QThread):
 
     def __init__(self, cam_obj, cam_id: int, use_cuda: bool = False, parent=None):
         super().__init__(parent)
-        self.cam     = cam_obj
-        self.cam_id  = cam_id
+        self.cam      = cam_obj
+        self.cam_id   = cam_id
         self.use_cuda = use_cuda
 
         self.running = True
         self.target_fps     = 15
-        self.diff_threshold = 30
+        self.diff_threshold = 5     # V4.0.1：預設值改為 5
 
         self._subtraction_enabled = False
         self._lock = threading.Lock()
-        self.bg_frame = None
 
+        # V4.0.1：bg_frame 凍結為靜態快照（uint8），不再持續 accumulateWeighted
+        self.bg_frame: Optional[np.ndarray] = None
+
+        # CUDA 背景快照旗標
+        self._cuda_bg_initialized = False
+
+    # ─────────────────────────────────────────────────────
+    # 啟用 / 停用影像相減
+    #   停用時清除背景快照，下次啟用重新拍攝第一幀
+    # ─────────────────────────────────────────────────────
     def set_subtraction(self, enabled: bool):
         with self._lock:
             self._subtraction_enabled = enabled
         if not enabled:
-            self.bg_frame = None
+            self._reset_background()
 
     def get_subtraction(self) -> bool:
         with self._lock:
             return self._subtraction_enabled
+
+    # ─────────────────────────────────────────────────────
+    # 重設背景快照（供外部呼叫，例如按下「重設背景」按鈕）
+    # ─────────────────────────────────────────────────────
+    def reset_background(self):
+        self._reset_background()
+
+    def _reset_background(self):
+        """清除背景，下一幀到來時自動重新凍結快照。"""
+        self.bg_frame = None
+        self._cuda_bg_initialized = False
 
     def run(self):
         stFrameInfo   = MV_FRAME_OUT_INFO_EX()
@@ -168,14 +192,12 @@ class CameraThread(QThread):
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
 
+        # CUDA 預配置
         if self.use_cuda:
-            gpu_frame       = cv2.cuda_GpuMat()
-            gpu_bg_f32      = cv2.cuda_GpuMat()
-            gpu_gray_f32    = cv2.cuda_GpuMat()
-            gpu_bg_8u       = cv2.cuda_GpuMat()
-            gaussian_filter = cv2.cuda.createGaussianFilter(
+            gpu_frame         = cv2.cuda_GpuMat()
+            gpu_bg_8u         = cv2.cuda_GpuMat()   # 凍結背景（uint8）
+            gaussian_filter   = cv2.cuda.createGaussianFilter(
                 cv2.CV_8UC1, cv2.CV_8UC1, (21, 21), 0)
-            is_bg_initialized = False
 
         while self.running:
             t0 = time.time()
@@ -209,31 +231,33 @@ class CameraThread(QThread):
                 coverage_pct = 0.0
 
                 if do_sub:
-                    # 縮小影像以節省小電腦/無GPU環境下的 CPU 資源，解決畫面卡頓問題
+                    # 縮小影像以節省運算資源
                     proc_w, proc_h = 640, 480
                     frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
 
                     if self.use_cuda:
+                        # ── CUDA 路徑：靜態背景快照 ──────────────
                         gpu_frame.upload(frame_gray_small)
                         gpu_gray = gaussian_filter.apply(gpu_frame)
-                        gpu_gray.convertTo(cv2.CV_32F, gpu_gray_f32)
-                        if not is_bg_initialized:
-                            gpu_gray.convertTo(cv2.CV_32F, gpu_bg_f32)
-                            is_bg_initialized = True
-                        gpu_bg_f32 = cv2.cuda.addWeighted(
-                            gpu_gray_f32, 0.01, gpu_bg_f32, 0.99, 0.0)
-                        gpu_bg_f32.convertTo(cv2.CV_8U, gpu_bg_8u)
-                        gpu_diff = cv2.cuda.absdiff(gpu_bg_8u, gpu_frame)
+
+                        if not self._cuda_bg_initialized:
+                            # 第一幀凍結為靜態背景，之後不再更新
+                            gpu_gray.copyTo(gpu_bg_8u)
+                            self._cuda_bg_initialized = True
+
+                        gpu_diff = cv2.cuda.absdiff(gpu_bg_8u, gpu_gray)
                         _, gpu_thresh = cv2.cuda.threshold(
                             gpu_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
                         thresh_res = gpu_thresh.download()
                     else:
+                        # ── CPU 路徑：靜態背景快照 ───────────────
                         gray = cv2.GaussianBlur(frame_gray_small, (21, 21), 0)
+
                         if self.bg_frame is None or self.bg_frame.shape != gray.shape:
-                            self.bg_frame = gray.copy().astype("float")
-                        cv2.accumulateWeighted(gray, self.bg_frame, 0.01)
-                        bg_current = cv2.convertScaleAbs(self.bg_frame)
-                        frame_diff = cv2.absdiff(bg_current, gray)
+                            # 第一幀凍結為靜態背景 uint8，之後不再更新
+                            self.bg_frame = gray.copy()
+
+                        frame_diff = cv2.absdiff(self.bg_frame, gray)
                         _, thresh_res = cv2.threshold(
                             frame_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
 
@@ -318,19 +342,20 @@ class FullscreenDialog(QDialog):
 
 
 # ===============================================================
-# CameraWidget：單一相機的顯示槽位 V4
+# CameraWidget：單一相機的顯示槽位 V4.0.1
 #   佈局：
-#     ┌── 工具列 (32px) ─────────────────────────────────┐
-#     │ #01  [下拉選單──────────────]  Cov:0.0%  [相減] [●]│
-#     ├──────────────────────────────────────────────────┤
-#     │          主影像（全寬全高，雙擊全螢幕）              │
-#     │                               ┌── PiP 差異 ──┐  │
-#     │                               └──────────────┘  │
-#     └──────────────────────────────────────────────────┘
+#     ┌── 工具列 (32px) ──────────────────────────────────────────┐
+#     │ #01  [下拉選單──────────]  Cov:0.0%  [重設背景] [相減] [●] │
+#     ├──────────────────────────────────────────────────────────┤
+#     │          主影像（全寬全高，雙擊全螢幕）                      │
+#     │                               ┌── PiP 差異 ──┐           │
+#     │                               └──────────────┘           │
+#     └──────────────────────────────────────────────────────────┘
 # ===============================================================
 class CameraWidget(QFrame):
     subtraction_toggled = pyqtSignal(int, bool)   # (cam_id, enabled)
     slot_cam_changed    = pyqtSignal(int, int)     # (slot_id, cam_id)
+    reset_bg_requested  = pyqtSignal(int)          # (cam_id)  V4.0.1
 
     def __init__(self, slot_id: int, cam_labels: list, parent=None):
         super().__init__(parent)
@@ -340,8 +365,8 @@ class CameraWidget(QFrame):
         self._sub_enabled = False
         self._coverage_alert_threshold = 50.0
         self._alert_active = False
-        self._fullscreen_dlg: FullscreenDialog | None = None
-        self._last_bgr: np.ndarray | None = None
+        self._fullscreen_dlg = None   # type: Optional[FullscreenDialog]
+        self._last_bgr = None         # type: Optional[np.ndarray]
         self._last_frame_time = 0.0
         self._setup_ui()
 
@@ -386,9 +411,9 @@ class CameraWidget(QFrame):
             }
         """)
         self.cam_combo.addItem("─ 未指派 ─", -1)
-        for i, label in enumerate(self.cam_labels):
+        for i, label in enumerate(cam_labels):
             self.cam_combo.addItem(label, i)
-        if self.slot_id < len(self.cam_labels):
+        if self.slot_id < len(cam_labels):
             self.cam_combo.setCurrentIndex(self.slot_id + 1)
         self.cam_combo.currentIndexChanged.connect(self._on_combo_changed)
         bar.addWidget(self.cam_combo, 1)
@@ -442,6 +467,23 @@ class CameraWidget(QFrame):
         self.alert_lbl.setStyleSheet(
             "color:#ff5555; font-size:12px; font-weight:bold;")
         bar.addWidget(self.alert_lbl)
+
+        # V4.0.1：重設背景按鈕
+        self.reset_bg_btn = QPushButton("重設背景")
+        self.reset_bg_btn.setFixedHeight(30)
+        self.reset_bg_btn.setMinimumWidth(76)
+        self.reset_bg_btn.setToolTip("清除背景快照，下一幀重新拍攝（僅相減開啟時有效）")
+        self.reset_bg_btn.setStyleSheet("""
+            QPushButton {
+                background:#1e2030; color:#889acc; border-radius:5px;
+                font-size:13px; border:1px solid #3a3a55;
+                padding:0 8px;
+            }
+            QPushButton:hover  { background:#252848; border-color:#5566aa; color:#aabbff; }
+            QPushButton:pressed{ background:#111122; }
+        """)
+        self.reset_bg_btn.clicked.connect(self._on_reset_bg_clicked)
+        bar.addWidget(self.reset_bg_btn)
 
         # 相減開關按鈕
         self.sub_btn = QPushButton("影像相減")
@@ -571,6 +613,13 @@ class CameraWidget(QFrame):
         super().mouseDoubleClickEvent(event)
 
     # ─────────────────────────────────────────────────────
+    #  V4.0.1：重設背景按鈕
+    # ─────────────────────────────────────────────────────
+    def _on_reset_bg_clicked(self):
+        """通知 MainWindow 對應 CameraThread 重設背景快照。"""
+        self.reset_bg_requested.emit(self._current_cam_id)
+
+    # ─────────────────────────────────────────────────────
     #  相減按鈕
     # ─────────────────────────────────────────────────────
     def _on_sub_toggled(self, checked: bool):
@@ -670,26 +719,26 @@ class CameraWidget(QFrame):
 
 
 # ===============================================================
-# MainWindow：主視窗  V4
+# MainWindow：主視窗  V4.0.1
 # ===============================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(
-            "Hikvision Multi-Camera Stream  V4.0  ─  最多 20 台 POE 相機")
+            "Hikvision Multi-Camera Stream  V4.0.1  ─  最多 20 台 POE 相機")
         self.resize(1920, 1080)
-        self.showMaximized()          # 啟動即最大化
+        self.showMaximized()
 
         self.device_list = MV_CC_DEVICE_INFO_LIST()
 
         # cam_id → {cam, thread}
-        self._cameras: dict[int, dict] = {}
+        self._cameras = {}   # type: dict
 
         # 相機顯示名稱清單
-        self._cam_labels: list[str] = [f"Cam {i:02d}" for i in range(MAX_CAMERAS)]
+        self._cam_labels = [f"Cam {i:02d}" for i in range(MAX_CAMERAS)]   # type: list
 
         # slot_id → cam_id 對應表
-        self._slot_to_cam: dict[int, int] = {i: i for i in range(MAX_CAMERAS)}
+        self._slot_to_cam = {i: i for i in range(MAX_CAMERAS)}   # type: dict
 
         self._setup_ui()
         self._apply_dark_theme()
@@ -785,13 +834,14 @@ class MainWindow(QMainWindow):
         self.fps_spin.valueChanged.connect(self._apply_fps)
         param_layout.addWidget(self.fps_spin)
 
+        # V4.0.1：靈敏度範圍 1~100，預設 5
         thresh_lbl = QLabel("相減靈敏度 (Threshold)：")
         thresh_lbl.setStyleSheet("font-size:13px;")
         param_layout.addWidget(thresh_lbl)
         self.thresh_slider = QSlider(Qt.Horizontal)
-        self.thresh_slider.setRange(5, 255)
-        self.thresh_slider.setValue(30)
-        self.thresh_lbl_val = QLabel("30")
+        self.thresh_slider.setRange(1, 100)   # ← 修改：原為 5~255
+        self.thresh_slider.setValue(5)        # ← 修改：預設 5
+        self.thresh_lbl_val = QLabel("5")     # ← 修改：初始顯示 5
         self.thresh_lbl_val.setFixedWidth(34)
         self.thresh_lbl_val.setStyleSheet("font-size:13px;")
         self.thresh_slider.valueChanged.connect(
@@ -806,6 +856,13 @@ class MainWindow(QMainWindow):
         self.sub_all_btn.setMinimumHeight(34)
         self.sub_all_btn.clicked.connect(self._toggle_all_subtraction)
         param_layout.addWidget(self.sub_all_btn)
+
+        # V4.0.1：全部重設背景按鈕
+        self.reset_all_bg_btn = QPushButton("🔄  全部重設背景快照")
+        self.reset_all_bg_btn.setMinimumHeight(34)
+        self.reset_all_bg_btn.setToolTip("清除所有相機的背景快照，下一幀重新拍攝")
+        self.reset_all_bg_btn.clicked.connect(self._reset_all_backgrounds)
+        param_layout.addWidget(self.reset_all_bg_btn)
 
         sep = QFrame()
         sep.setFrameShape(QFrame.HLine)
@@ -880,11 +937,11 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover { background: #202040; }
         """)
 
-        self._cam_widgets: list[CameraWidget] = []
+        self._cam_widgets = []   # type: list
 
         for page in range(PAGE_COUNT):
             page_widget = QWidget()
-            page_layout = QHBoxLayout(page_widget)   # ← 左右並排
+            page_layout = QHBoxLayout(page_widget)   # 左右並排
             page_layout.setContentsMargins(6, 6, 6, 6)
             page_layout.setSpacing(8)
 
@@ -893,7 +950,8 @@ class MainWindow(QMainWindow):
                 cw = CameraWidget(slot_id, self._cam_labels)
                 cw.subtraction_toggled.connect(self._on_subtraction_toggled)
                 cw.slot_cam_changed.connect(self._on_slot_cam_changed)
-                page_layout.addWidget(cw, 1)      # stretch=1：各自佔半邊
+                cw.reset_bg_requested.connect(self._on_reset_bg_requested)   # V4.0.1
+                page_layout.addWidget(cw, 1)
                 self._cam_widgets.append(cw)
 
             first = page * CAMS_PER_PAGE + 1
@@ -1095,7 +1153,8 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────
     # 影像接收
     # ──────────────────────────────────────────────────────────
-    def _on_frame_ready(self, cam_id: int, bgr: np.ndarray, diff: np.ndarray, coverage: float):
+    def _on_frame_ready(self, cam_id: int, bgr: np.ndarray,
+                        diff: np.ndarray, coverage: float):
         slot = self._get_slot_for_cam(cam_id)
         if 0 <= slot < len(self._cam_widgets):
             self._cam_widgets[slot].update_frames(bgr, diff, coverage)
@@ -1118,6 +1177,19 @@ class MainWindow(QMainWindow):
             cam_id = cw.current_cam_id()
             if cam_id in self._cameras:
                 self._cameras[cam_id]["thread"].set_subtraction(checked)
+
+    # ──────────────────────────────────────────────────────────
+    # V4.0.1：重設背景快照
+    # ──────────────────────────────────────────────────────────
+    def _on_reset_bg_requested(self, cam_id: int):
+        """單台相機重設背景快照。"""
+        if cam_id in self._cameras:
+            self._cameras[cam_id]["thread"].reset_background()
+
+    def _reset_all_backgrounds(self):
+        """全部相機重設背景快照。"""
+        for entry in self._cameras.values():
+            entry["thread"].reset_background()
 
     # ──────────────────────────────────────────────────────────
     # 全域 Alert 閾值
