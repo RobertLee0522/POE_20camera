@@ -57,17 +57,84 @@ from PyQt5.QtWidgets import (
     QLabel, QSlider, QPushButton, QComboBox, QSpinBox, QGroupBox,
     QMessageBox, QRadioButton, QButtonGroup, QScrollArea, QGridLayout,
     QCheckBox, QSizePolicy, QFrame, QSplitter, QListWidget, QListWidgetItem,
-    QTabWidget, QDoubleSpinBox, QDialog
+    QTabWidget, QDoubleSpinBox, QDialog, QStackedWidget
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QCursor
 
 import cv2
+from typing import Optional
+from datetime import datetime, timedelta
+
+# matplotlib 嵌入 Qt（折線圖用，不需 pyqtgraph）
+import matplotlib
+matplotlib.use("Qt5Agg")
+# 讓圖表能正確顯示中文（避免缺字方框）
+matplotlib.rcParams["font.sans-serif"] = [
+    "Microsoft JhengHei", "Microsoft YaHei", "Noto Sans CJK TC", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib.dates as mdates
 
 # ── 佈局常數 ─────────────────────────────────────────────────
 MAX_CAMERAS   = 20
 CAMS_PER_PAGE = 2    # 每頁 2 台，左右並排
 PAGE_COUNT    = MAX_CAMERAS // CAMS_PER_PAGE   # 10 頁
+
+# ── Coverage 紀錄 ────────────────────────────────────────────
+LOG_DIR          = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "coverage_logs")
+LOG_INTERVAL_SEC = 60     # 每分鐘記錄一次
+DEFAULT_DAYS     = 1      # 折線圖預設顯示 1 天
+MAX_DAYS         = 5      # 最多顯示 5 天
+
+# cam_id(裝置列舉索引) → 穩定檔名鍵（序號/IP），由 enum_devices 填入
+CAM_KEYS = {}   # type: dict
+
+
+def cam_logfile(cam_id: int) -> str:
+    """取得某台相機的 Coverage log 檔路徑（依序號/IP 命名，跨次啟動穩定）。"""
+    key = CAM_KEYS.get(cam_id) or f"cam{cam_id:02d}"
+    return os.path.join(LOG_DIR, f"{key}.txt")
+
+
+def append_log(cam_id: int, value: float, when: datetime):
+    """附加一行『時間<TAB>數值』到對應相機的 log。"""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(cam_logfile(cam_id), "a", encoding="utf-8") as f:
+            f.write(f"{when:%Y-%m-%d %H:%M}\t{value:.2f}\n")
+    except Exception as e:
+        print(f"[WARN] 寫入 Coverage log 失敗 cam{cam_id}: {e}")
+
+
+def read_log(filepath: str, days: int):
+    """讀回 log，過濾最近 N 天，回傳 (times[list[datetime]], values[list[float]])。"""
+    times, values = [], []
+    if not filepath or not os.path.exists(filepath):
+        return times, values
+    cutoff = datetime.now() - timedelta(days=days)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                try:
+                    ts = datetime.strptime(parts[0], "%Y-%m-%d %H:%M")
+                    v  = float(parts[1])
+                except ValueError:
+                    continue
+                if ts >= cutoff:
+                    times.append(ts)
+                    values.append(v)
+    except Exception as e:
+        print(f"[WARN] 讀取 Coverage log 失敗 {filepath}: {e}")
+    return times, values
 
 
 # -------------------------------------------------------
@@ -329,6 +396,16 @@ TR = {
     "lang_tip":         ("切換中／英介面", "Switch Chinese / English"),
     "unassigned":       ("─ 未指派 ─", "─ Unassigned ─"),
     "no_device":        ("（未偵測到設備）", "(No devices found)"),
+    # ── 折線圖 ──
+    "show_chart":       ("📈 折線圖", "📈 Chart"),
+    "show_live":        ("🎥 即時畫面", "🎥 Live"),
+    "chart_days":       ("顯示天數", "Days"),
+    "day_n":            ("{d} 天", "{d} d"),
+    "chart_ylabel":     ("覆蓋率 (%)", "Coverage (%)"),
+    "chart_xlabel":     ("時間", "Time"),
+    "chart_title":      ("每分鐘平均覆蓋率", "Per-minute Avg Coverage"),
+    "chart_no_data":    ("尚無紀錄資料\n（開啟『影像相減』後每分鐘自動記錄）",
+                         "No data yet\n(records every minute once subtraction is ON)"),
     # ── 相機格 CameraWidget ──
     "alert_spin_tip":   ("覆蓋率超過此值觸發 Alert", "Trigger alert when coverage exceeds this"),
     "reset_bg":         ("重設背景", "Reset BG"),
@@ -358,6 +435,97 @@ def tr(key: str, **kw) -> str:
     """依目前 LANG 取得對應文字；kw 用於格式化（例如 n=3）。"""
     s = TR[key][1 if LANG == "en" else 0]
     return s.format(**kw) if kw else s
+
+
+# ===============================================================
+# CoverageChart：單台相機的覆蓋率折線圖（matplotlib 嵌入）
+# ===============================================================
+class CoverageChart(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._days     = DEFAULT_DAYS
+        self._logfile  = None   # type: Optional[str]
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        root.setSpacing(4)
+
+        # 上方：顯示天數選擇
+        bar = QHBoxLayout()
+        bar.setContentsMargins(0, 0, 0, 0)
+        self.days_lbl = QLabel(tr("chart_days"))
+        self.days_lbl.setStyleSheet("font-size:12px; color:#88a0cc;")
+        bar.addWidget(self.days_lbl)
+
+        self.days_combo = QComboBox()
+        self.days_combo.setFixedWidth(80)
+        self.days_combo.setStyleSheet(
+            "background:#1a1a30; border:1px solid #3a3a5a; border-radius:4px;"
+            " padding:2px 6px; font-size:12px; color:#a8c0ff;")
+        for d in range(1, MAX_DAYS + 1):
+            self.days_combo.addItem(tr("day_n", d=d), d)
+        self.days_combo.setCurrentIndex(DEFAULT_DAYS - 1)
+        self.days_combo.currentIndexChanged.connect(self._on_days_changed)
+        bar.addWidget(self.days_combo)
+        bar.addStretch()
+        root.addLayout(bar)
+
+        # matplotlib 畫布（深色主題）
+        self.fig = Figure(figsize=(4, 3), dpi=90, facecolor="#0c0c1c")
+        self.canvas = FigureCanvas(self.fig)
+        self.ax = self.fig.add_subplot(111)
+        root.addWidget(self.canvas, 1)
+
+        self._render([], [])
+
+    # ── 對外 API ──────────────────────────────────────────
+    def set_logfile(self, path: Optional[str]):
+        self._logfile = path
+        self.refresh()
+
+    def refresh(self):
+        times, values = read_log(self._logfile, self._days)
+        self._render(times, values)
+
+    def retranslate(self):
+        self.days_lbl.setText(tr("chart_days"))
+        for i in range(self.days_combo.count()):
+            d = self.days_combo.itemData(i)
+            self.days_combo.setItemText(i, tr("day_n", d=d))
+        self.refresh()
+
+    # ── 內部 ─────────────────────────────────────────────
+    def _on_days_changed(self, index: int):
+        self._days = self.days_combo.itemData(index) or DEFAULT_DAYS
+        self.refresh()
+
+    def _render(self, times, values):
+        self.ax.clear()
+        self.ax.set_facecolor("#0c0c1c")
+        for spine in self.ax.spines.values():
+            spine.set_color("#33335a")
+        self.ax.tick_params(colors="#8899bb", labelsize=8)
+        self.ax.set_title(tr("chart_title"), color="#aaccff", fontsize=10)
+        self.ax.set_ylabel(tr("chart_ylabel"), color="#88a0cc", fontsize=9)
+        self.ax.set_ylim(0, 100)
+        self.ax.grid(True, color="#22223a", linewidth=0.5)
+
+        if times:
+            self.ax.plot(times, values, color="#55ccee", linewidth=1.4,
+                         marker="o", markersize=2.5, markerfacecolor="#aaddff")
+            self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d %H:%M"))
+            self.fig.autofmt_xdate(rotation=30, ha="right")
+        else:
+            self.ax.text(0.5, 0.5, tr("chart_no_data"),
+                         ha="center", va="center", color="#556699", fontsize=10,
+                         transform=self.ax.transAxes)
+            self.ax.set_xticks([])
+
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        self.canvas.draw_idle()
 
 
 # ===============================================================
@@ -433,6 +601,10 @@ class CameraWidget(QFrame):
         self._last_bgr = None         # type: Optional[np.ndarray]
         self._last_frame_time = 0.0
         self._conn_state = "waiting"  # waiting / streaming / stopped（供語言切換重繪用）
+        # Coverage 每分鐘累加器（只在相減 ON 時累加）
+        self._minute_sum   = 0.0
+        self._minute_count = 0
+        self._chart_mode   = False    # False=即時畫面, True=折線圖
         self._setup_ui()
 
     # ─────────────────────────────────────────────────────
@@ -449,7 +621,7 @@ class CameraWidget(QFrame):
 
         # ── 工具列 ─────────────────────────────────────────
         bar = QHBoxLayout()
-        bar.setSpacing(8)
+        bar.setSpacing(4)
         bar.setContentsMargins(0, 0, 0, 0)
 
         # 槽位編號標籤
@@ -467,7 +639,7 @@ class CameraWidget(QFrame):
                 background:#1a1a30; border:1px solid #3a3a5a;
                 border-radius:4px; padding:2px 6px;
                 font-size:13px; color:#a8c0ff;
-                min-width:180px;
+                min-width:60px;
             }
             QComboBox::drop-down { border:none; width:18px; }
             QComboBox QAbstractItemView {
@@ -485,7 +657,7 @@ class CameraWidget(QFrame):
 
         # 解析度標籤
         self.res_lbl = QLabel("----×----")
-        self.res_lbl.setFixedWidth(90)
+        self.res_lbl.setFixedWidth(64)
         self.res_lbl.setStyleSheet(
             "color:#668899; font-size:12px; qproperty-alignment:AlignRight;")
         bar.addWidget(self.res_lbl)
@@ -528,15 +700,29 @@ class CameraWidget(QFrame):
         bar.addWidget(self.alert_spin)
 
         self.alert_lbl = QLabel()
-        self.alert_lbl.setFixedWidth(64)
+        self.alert_lbl.setFixedWidth(40)
         self.alert_lbl.setStyleSheet(
             "color:#ff5555; font-size:12px; font-weight:bold;")
         bar.addWidget(self.alert_lbl)
 
+        # 畫面 / 折線圖 切換按鈕
+        self.view_btn = QPushButton(tr("show_chart"))
+        self.view_btn.setFixedHeight(30)
+        self.view_btn.setToolTip(tr("show_chart"))
+        self.view_btn.setStyleSheet("""
+            QPushButton {
+                background:#1e2030; color:#88a0cc; border-radius:5px;
+                font-size:13px; border:1px solid #3a3a55; padding:0 8px;
+            }
+            QPushButton:hover  { background:#252848; border-color:#5566aa; color:#aabbff; }
+            QPushButton:pressed{ background:#111122; }
+        """)
+        self.view_btn.clicked.connect(self._toggle_view)
+        bar.addWidget(self.view_btn)
+
         # V4.0.1：重設背景按鈕
         self.reset_bg_btn = QPushButton(tr("reset_bg"))
         self.reset_bg_btn.setFixedHeight(30)
-        self.reset_bg_btn.setMinimumWidth(76)
         self.reset_bg_btn.setToolTip(tr("reset_bg_tip"))
         self.reset_bg_btn.setStyleSheet("""
             QPushButton {
@@ -554,7 +740,7 @@ class CameraWidget(QFrame):
         self.sub_btn = QPushButton(tr("subtract"))
         self.sub_btn.setCheckable(True)
         self.sub_btn.setFixedHeight(30)
-        self.sub_btn.setMinimumWidth(80)
+        self.sub_btn.setMinimumWidth(72)
         self.sub_btn.setStyleSheet("""
             QPushButton {
                 background:#222238; color:#7788aa; border-radius:5px;
@@ -603,7 +789,14 @@ class CameraWidget(QFrame):
         self.diff_lbl.setText(tr("diff"))
         self.diff_lbl.setVisible(False)
 
-        root.addWidget(self.img_container, 1)
+        # ── 折線圖 ──────────────────────────────────────────
+        self.chart = CoverageChart()
+
+        # ── 即時畫面 / 折線圖 切換堆疊 ──────────────────────
+        self.view_stack = QStackedWidget()
+        self.view_stack.addWidget(self.img_container)   # index 0：即時畫面
+        self.view_stack.addWidget(self.chart)           # index 1：折線圖
+        root.addWidget(self.view_stack, 1)
 
     # ─────────────────────────────────────────────────────
     #  樣式
@@ -636,6 +829,9 @@ class CameraWidget(QFrame):
         cam_id = self.cam_combo.itemData(index)
         self._current_cam_id = cam_id if cam_id is not None else -1
         self.slot_cam_changed.emit(self.slot_id, self._current_cam_id)
+        # 切換相機時，若正在看折線圖，重新載入新相機的紀錄
+        if self._chart_mode:
+            self.chart.set_logfile(cam_logfile(self._current_cam_id))
 
     def set_cam_labels(self, cam_labels: list):
         old_cam_id = self._current_cam_id
@@ -715,6 +911,40 @@ class CameraWidget(QFrame):
             self.orig_lbl.setText(tr("waiting_conn"))
             self.status_lbl.setToolTip(tr("disconnected"))
 
+        self.view_btn.setText(tr("show_live") if self._chart_mode else tr("show_chart"))
+        self.view_btn.setToolTip(self.view_btn.text())
+        self.chart.retranslate()
+
+    # ─────────────────────────────────────────────────────
+    #  Coverage 紀錄 / 折線圖
+    # ─────────────────────────────────────────────────────
+    def pop_minute_avg(self):
+        """回傳並清空本分鐘累加的 Coverage 平均；無資料回 None。"""
+        if self._minute_count > 0:
+            avg = self._minute_sum / self._minute_count
+            self._minute_sum   = 0.0
+            self._minute_count = 0
+            return avg
+        self._minute_sum   = 0.0
+        self._minute_count = 0
+        return None
+
+    def _toggle_view(self):
+        self._chart_mode = not self._chart_mode
+        if self._chart_mode:
+            self.chart.set_logfile(cam_logfile(self._current_cam_id))
+            self.view_stack.setCurrentIndex(1)
+            self.view_btn.setText(tr("show_live"))
+        else:
+            self.view_stack.setCurrentIndex(0)
+            self.view_btn.setText(tr("show_chart"))
+        self.view_btn.setToolTip(self.view_btn.text())
+
+    def refresh_chart_if_visible(self):
+        """若目前顯示折線圖，重新載入最新資料。"""
+        if self._chart_mode:
+            self.chart.set_logfile(cam_logfile(self._current_cam_id))
+
     # ─────────────────────────────────────────────────────
     #  Alert 閾值
     # ─────────────────────────────────────────────────────
@@ -758,6 +988,11 @@ class CameraWidget(QFrame):
 
         # 覆蓋率文字
         self.cov_lbl.setText(f"{coverage:.1f}%")
+
+        # 每分鐘累加（只在相減 ON 時記錄）
+        if self._sub_enabled:
+            self._minute_sum   += coverage
+            self._minute_count += 1
 
         # 解析度
         h_img, w_img = bgr.shape[:2]
@@ -835,6 +1070,29 @@ class MainWindow(QMainWindow):
         self.monitor_thread = MonitorThread()
         self.monitor_thread.stats_ready.connect(self._on_monitor_stats)
         self.monitor_thread.start()
+
+        # 每分鐘記錄 Coverage（只在相減 ON 的相機）
+        os.makedirs(LOG_DIR, exist_ok=True)
+        self.log_timer = QTimer(self)
+        self.log_timer.timeout.connect(self._flush_logs)
+        self.log_timer.start(LOG_INTERVAL_SEC * 1000)
+
+    # ──────────────────────────────────────────────────────────
+    # 每分鐘紀錄 Coverage 並更新折線圖
+    # ──────────────────────────────────────────────────────────
+    def _flush_logs(self):
+        now = datetime.now()
+        for cw in self._cam_widgets:
+            avg = cw.pop_minute_avg()
+            if avg is None:
+                continue
+            cam_id = cw.current_cam_id()
+            if cam_id is None or cam_id < 0:
+                continue
+            append_log(cam_id, avg, now)
+        # 若有相機格正在看折線圖，重新載入最新資料
+        for cw in self._cam_widgets:
+            cw.refresh_chart_if_visible()
 
     # ──────────────────────────────────────────────────────────
     # UI 建構
@@ -1203,6 +1461,10 @@ class MainWindow(QMainWindow):
 
             self._cam_labels.append(label)
             self.dev_list.addItem(f"[{i:02d}]  {label}")
+
+            # 穩定檔名鍵（序號優先，其次 IP），跨次啟動不變
+            raw_key = serial or ip or f"cam{i:02d}"
+            CAM_KEYS[i] = "".join(c if c.isalnum() else "_" for c in raw_key)
 
         if n == 0:
             self.dev_list.addItem(tr("no_device"))

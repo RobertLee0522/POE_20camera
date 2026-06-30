@@ -4,6 +4,9 @@
 
 __pycache__/
 *.pyc
+
+# Coverage 每分鐘紀錄（執行時自動產生）
+coverage_logs/
 multi_cam_stream_fix.py
 test.py
 test_*.py
