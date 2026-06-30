@@ -297,12 +297,76 @@ class CameraThread(QThread):
 
 
 # ===============================================================
+# i18n：中／英 介面文字（一鍵切換）
+# ===============================================================
+LANG = "zh"   # 目前介面語言："zh" 或 "en"
+
+TR = {
+    # ── 左側控制欄 ──
+    "hw_monitor":       ("🖥  硬體監控", "🖥  Hardware Monitor"),
+    "cam_control":      ("📷  相機控制", "📷  Camera Control"),
+    "refresh_dev":      ("🔍  刷新設備列表", "🔍  Refresh Devices"),
+    "compute_mode":     ("運算模式：", "Compute Mode:"),
+    "cuda_na":          ("未偵測到 CUDA", "CUDA not detected"),
+    "start_all":        ("▶  開啟全部相機", "▶  Start All Cameras"),
+    "stop_all":         ("■  停止全部相機", "■  Stop All Cameras"),
+    "global_params":    ("⚙  全域串流參數", "⚙  Global Stream Params"),
+    "fps_limit":        ("FPS 限制（每台）：", "FPS Limit (per cam):"),
+    "threshold":        ("相減靈敏度 (Threshold)：", "Subtraction Sensitivity (Threshold):"),
+    "sub_all_off":      ("🔁  全部影像相減 ON/OFF", "🔁  Subtract All ON/OFF"),
+    "sub_all_on":       ("🔁  全部相減 ON", "🔁  Subtract All ON"),
+    "reset_all_bg":     ("🔄  全部重設背景快照", "🔄  Reset All Backgrounds"),
+    "reset_all_bg_tip": ("清除所有相機的背景快照，下一幀重新拍攝",
+                         "Clear all cameras' background snapshots; recapture next frame"),
+    "alert_hdr":        ("⚠  全域覆蓋率 Alert 閾值：", "⚠  Global Coverage Alert Threshold:"),
+    "global_alert_tip": ("套用到所有相機的預設 Alert 閾值",
+                         "Default alert threshold applied to all cameras"),
+    "apply_all":        ("套用至全部", "Apply to All"),
+    "detected_dev":     ("📋  偵測到的設備", "📋  Detected Devices"),
+    "win_title":        ("Hikvision Multi-Camera Stream  V4.0.1  ─  最多 20 台 POE 相機",
+                         "Hikvision Multi-Camera Stream  V4.0.1  ─  up to 20 POE cameras"),
+    "streaming_n":      ("串流中：{n} 台", "Streaming: {n}"),
+    "lang_tip":         ("切換中／英介面", "Switch Chinese / English"),
+    "unassigned":       ("─ 未指派 ─", "─ Unassigned ─"),
+    "no_device":        ("（未偵測到設備）", "(No devices found)"),
+    # ── 相機格 CameraWidget ──
+    "alert_spin_tip":   ("覆蓋率超過此值觸發 Alert", "Trigger alert when coverage exceeds this"),
+    "reset_bg":         ("重設背景", "Reset BG"),
+    "reset_bg_tip":     ("清除背景快照，下一幀重新拍攝（僅相減開啟時有效）",
+                         "Clear background snapshot; recapture next frame (only when subtraction is on)"),
+    "subtract":         ("影像相減", "Subtract"),
+    "sub_on":           ("相減 ON", "Sub ON"),
+    "disconnected":     ("未連線", "Disconnected"),
+    "waiting_conn":     ("等待連線...", "Waiting..."),
+    "diff":             ("差異", "Diff"),
+    "streaming":        ("串流中", "Streaming"),
+    "stopped":          ("已停止", "Stopped"),
+    # ── 全螢幕對話框 ──
+    "fs_title":         ("全螢幕 — {title}", "Fullscreen — {title}"),
+    "waiting_img":      ("等待影像...", "Waiting for image..."),
+    "fs_hint":          ("按 Esc 或雙擊關閉", "Press Esc or double-click to close"),
+    # ── 訊息框 ──
+    "err":              ("錯誤", "Error"),
+    "enum_fail":        ("列舉設備失敗，ret=0x{ret:08X}", "Device enumeration failed, ret=0x{ret:08X}"),
+    "cuda_err":         ("CUDA 錯誤", "CUDA Error"),
+    "cuda_fallback":    ("未偵測到 CUDA，已自動切換至 CPU 模式",
+                         "CUDA not detected; switched to CPU mode"),
+}
+
+
+def tr(key: str, **kw) -> str:
+    """依目前 LANG 取得對應文字；kw 用於格式化（例如 n=3）。"""
+    s = TR[key][1 if LANG == "en" else 0]
+    return s.format(**kw) if kw else s
+
+
+# ===============================================================
 # FullscreenDialog：雙擊影像後的全螢幕獨立視窗
 # ===============================================================
 class FullscreenDialog(QDialog):
     def __init__(self, title: str, parent=None):
         super().__init__(parent, Qt.Window)
-        self.setWindowTitle(f"全螢幕 — {title}")
+        self.setWindowTitle(tr("fs_title", title=title))
         self.setStyleSheet("background:#000;")
         self.showMaximized()
 
@@ -312,11 +376,11 @@ class FullscreenDialog(QDialog):
         self.img_lbl = QLabel()
         self.img_lbl.setAlignment(Qt.AlignCenter)
         self.img_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.img_lbl.setText("等待影像...")
+        self.img_lbl.setText(tr("waiting_img"))
         self.img_lbl.setStyleSheet("color:#555; font-size:20px;")
         layout.addWidget(self.img_lbl)
 
-        hint = QLabel("按 Esc 或雙擊關閉")
+        hint = QLabel(tr("fs_hint"))
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color:#333; font-size:12px; padding: 4px;")
         layout.addWidget(hint)
@@ -368,6 +432,7 @@ class CameraWidget(QFrame):
         self._fullscreen_dlg = None   # type: Optional[FullscreenDialog]
         self._last_bgr = None         # type: Optional[np.ndarray]
         self._last_frame_time = 0.0
+        self._conn_state = "waiting"  # waiting / streaming / stopped（供語言切換重繪用）
         self._setup_ui()
 
     # ─────────────────────────────────────────────────────
@@ -410,10 +475,10 @@ class CameraWidget(QFrame):
                 font-size:13px;
             }
         """)
-        self.cam_combo.addItem("─ 未指派 ─", -1)
-        for i, label in enumerate(cam_labels):
+        self.cam_combo.addItem(tr("unassigned"), -1)
+        for i, label in enumerate(self.cam_labels):
             self.cam_combo.addItem(label, i)
-        if self.slot_id < len(cam_labels):
+        if self.slot_id < len(self.cam_labels):
             self.cam_combo.setCurrentIndex(self.slot_id + 1)
         self.cam_combo.currentIndexChanged.connect(self._on_combo_changed)
         bar.addWidget(self.cam_combo, 1)
@@ -452,7 +517,7 @@ class CameraWidget(QFrame):
         self.alert_spin.setDecimals(0)
         self.alert_spin.setFixedWidth(72)
         self.alert_spin.setMinimumHeight(30)
-        self.alert_spin.setToolTip("覆蓋率超過此值觸發 Alert")
+        self.alert_spin.setToolTip(tr("alert_spin_tip"))
         self.alert_spin.setStyleSheet("""
             QDoubleSpinBox {
                 background:#1a1a30; border:1px solid #3a3a5a;
@@ -469,10 +534,10 @@ class CameraWidget(QFrame):
         bar.addWidget(self.alert_lbl)
 
         # V4.0.1：重設背景按鈕
-        self.reset_bg_btn = QPushButton("重設背景")
+        self.reset_bg_btn = QPushButton(tr("reset_bg"))
         self.reset_bg_btn.setFixedHeight(30)
         self.reset_bg_btn.setMinimumWidth(76)
-        self.reset_bg_btn.setToolTip("清除背景快照，下一幀重新拍攝（僅相減開啟時有效）")
+        self.reset_bg_btn.setToolTip(tr("reset_bg_tip"))
         self.reset_bg_btn.setStyleSheet("""
             QPushButton {
                 background:#1e2030; color:#889acc; border-radius:5px;
@@ -486,7 +551,7 @@ class CameraWidget(QFrame):
         bar.addWidget(self.reset_bg_btn)
 
         # 相減開關按鈕
-        self.sub_btn = QPushButton("影像相減")
+        self.sub_btn = QPushButton(tr("subtract"))
         self.sub_btn.setCheckable(True)
         self.sub_btn.setFixedHeight(30)
         self.sub_btn.setMinimumWidth(80)
@@ -507,7 +572,7 @@ class CameraWidget(QFrame):
         self.status_lbl = QLabel("●")
         self.status_lbl.setFixedWidth(18)
         self.status_lbl.setStyleSheet("color:#3a3a55; font-size:16px;")
-        self.status_lbl.setToolTip("未連線")
+        self.status_lbl.setToolTip(tr("disconnected"))
         bar.addWidget(self.status_lbl)
 
         root.addLayout(bar)
@@ -524,7 +589,7 @@ class CameraWidget(QFrame):
         self.orig_lbl.setStyleSheet(
             "background:transparent; color:#2a2a4a; font-size:14px;")
         self.orig_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.orig_lbl.setText("等待連線...")
+        self.orig_lbl.setText(tr("waiting_conn"))
 
         # PiP 差異縮圖
         self.diff_lbl = QLabel(self.img_container)
@@ -535,7 +600,7 @@ class CameraWidget(QFrame):
             border-radius:3px;
             color:#333; font-size:11px;
         """)
-        self.diff_lbl.setText("差異")
+        self.diff_lbl.setText(tr("diff"))
         self.diff_lbl.setVisible(False)
 
         root.addWidget(self.img_container, 1)
@@ -576,7 +641,7 @@ class CameraWidget(QFrame):
         old_cam_id = self._current_cam_id
         self.cam_combo.blockSignals(True)
         self.cam_combo.clear()
-        self.cam_combo.addItem("─ 未指派 ─", -1)
+        self.cam_combo.addItem(tr("unassigned"), -1)
         for i, label in enumerate(cam_labels):
             self.cam_combo.addItem(label, i)
         for i in range(self.cam_combo.count()):
@@ -624,9 +689,31 @@ class CameraWidget(QFrame):
     # ─────────────────────────────────────────────────────
     def _on_sub_toggled(self, checked: bool):
         self._sub_enabled = checked
-        self.sub_btn.setText("相減 ON" if checked else "影像相減")
+        self.sub_btn.setText(tr("sub_on") if checked else tr("subtract"))
         self.diff_lbl.setVisible(checked)
         self.subtraction_toggled.emit(self._current_cam_id, checked)
+
+    # ─────────────────────────────────────────────────────
+    #  語言切換：重繪本格所有文字
+    # ─────────────────────────────────────────────────────
+    def retranslate(self):
+        # 下拉第 0 項「未指派」
+        if self.cam_combo.count() > 0 and self.cam_combo.itemData(0) == -1:
+            self.cam_combo.setItemText(0, tr("unassigned"))
+        self.reset_bg_btn.setText(tr("reset_bg"))
+        self.reset_bg_btn.setToolTip(tr("reset_bg_tip"))
+        self.alert_spin.setToolTip(tr("alert_spin_tip"))
+        self.diff_lbl.setText(tr("diff"))
+        self.sub_btn.setText(tr("sub_on") if self._sub_enabled else tr("subtract"))
+
+        if self._conn_state == "streaming":
+            self.status_lbl.setToolTip(tr("streaming"))
+        elif self._conn_state == "stopped":
+            self.orig_lbl.setText(tr("stopped"))
+            self.status_lbl.setToolTip(tr("stopped"))
+        else:   # waiting
+            self.orig_lbl.setText(tr("waiting_conn"))
+            self.status_lbl.setToolTip(tr("disconnected"))
 
     # ─────────────────────────────────────────────────────
     #  Alert 閾值
@@ -689,13 +776,15 @@ class CameraWidget(QFrame):
             self.alert_lbl.setText("")
 
         # 狀態燈
+        self._conn_state = "streaming"
         self.status_lbl.setText("●")
         self.status_lbl.setStyleSheet("color:#2ecc71; font-size:16px;")
-        self.status_lbl.setToolTip("串流中")
+        self.status_lbl.setToolTip(tr("streaming"))
 
     def set_disconnected(self):
+        self._conn_state = "stopped"
         self._last_bgr = None
-        self.orig_lbl.setText("已停止")
+        self.orig_lbl.setText(tr("stopped"))
         self.orig_lbl.setPixmap(QPixmap())
         self.diff_lbl.setVisible(False)
         self.res_lbl.setText("----×----")
@@ -703,7 +792,7 @@ class CameraWidget(QFrame):
         self._last_frame_time = 0.0
         self.status_lbl.setText("●")
         self.status_lbl.setStyleSheet("color:#cc3333; font-size:16px;")
-        self.status_lbl.setToolTip("已停止")
+        self.status_lbl.setToolTip(tr("stopped"))
         self.cov_lbl.setText("--")
         self.alert_lbl.setText("")
         self._alert_active = False
@@ -724,8 +813,7 @@ class CameraWidget(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(
-            "Hikvision Multi-Camera Stream  V4.0.1  ─  最多 20 台 POE 相機")
+        self.setWindowTitle(tr("win_title"))
         self.resize(1920, 1080)
         self.showMaximized()
 
@@ -764,34 +852,44 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(10)
 
+        # 0. 語言切換（🌐 一鍵中／英）
+        lang_bar = QHBoxLayout()
+        lang_bar.addStretch()
+        self.lang_btn = QPushButton("🌐 EN")
+        self.lang_btn.setFixedSize(64, 30)
+        self.lang_btn.setToolTip(tr("lang_tip"))
+        self.lang_btn.clicked.connect(self._toggle_language)
+        lang_bar.addWidget(self.lang_btn)
+        left_layout.addLayout(lang_bar)
+
         # 1. 硬體監控
-        hw_group = QGroupBox("🖥  硬體監控")
-        hw_layout = QVBoxLayout(hw_group)
+        self.hw_group = QGroupBox(tr("hw_monitor"))
+        hw_layout = QVBoxLayout(self.hw_group)
         hw_layout.setSpacing(4)
         self.cpu_lbl     = QLabel("CPU:  -- %")
         self.ram_lbl     = QLabel("RAM:  -- %")
         self.gpu_lbl     = QLabel("GPU:  -- %")
         self.vram_lbl    = QLabel("VRAM: -- / -- MB")
-        self.cam_cnt_lbl = QLabel("串流中：0 台")
+        self.cam_cnt_lbl = QLabel(tr("streaming_n", n=0))
         for lbl in (self.cpu_lbl, self.ram_lbl, self.gpu_lbl,
                     self.vram_lbl, self.cam_cnt_lbl):
             lbl.setStyleSheet("font-size:13px; padding:2px 0;")
             hw_layout.addWidget(lbl)
-        left_layout.addWidget(hw_group)
+        left_layout.addWidget(self.hw_group)
 
         # 2. 相機控制
-        ctrl_group = QGroupBox("📷  相機控制")
-        ctrl_layout = QVBoxLayout(ctrl_group)
+        self.ctrl_group = QGroupBox(tr("cam_control"))
+        ctrl_layout = QVBoxLayout(self.ctrl_group)
         ctrl_layout.setSpacing(6)
 
-        self.enum_btn = QPushButton("🔍  刷新設備列表")
+        self.enum_btn = QPushButton(tr("refresh_dev"))
         self.enum_btn.setMinimumHeight(34)
         self.enum_btn.clicked.connect(self.enum_devices)
         ctrl_layout.addWidget(self.enum_btn)
 
-        mode_lbl = QLabel("運算模式：")
-        mode_lbl.setStyleSheet("font-size:13px;")
-        ctrl_layout.addWidget(mode_lbl)
+        self.mode_lbl = QLabel(tr("compute_mode"))
+        self.mode_lbl.setStyleSheet("font-size:13px;")
+        ctrl_layout.addWidget(self.mode_lbl)
         mode_h = QHBoxLayout()
         self.cpu_radio  = QRadioButton("CPU")
         self.cuda_radio = QRadioButton("CUDA (GPU)")
@@ -800,7 +898,7 @@ class MainWindow(QMainWindow):
         self.cpu_radio.setChecked(True)
         if not HAS_CUDA:
             self.cuda_radio.setEnabled(False)
-            self.cuda_radio.setToolTip("未偵測到 CUDA")
+            self.cuda_radio.setToolTip(tr("cuda_na"))
         mode_grp = QButtonGroup(self)
         mode_grp.addButton(self.cpu_radio)
         mode_grp.addButton(self.cuda_radio)
@@ -808,24 +906,24 @@ class MainWindow(QMainWindow):
         mode_h.addWidget(self.cuda_radio)
         ctrl_layout.addLayout(mode_h)
 
-        self.start_all_btn = QPushButton("▶  開啟全部相機")
+        self.start_all_btn = QPushButton(tr("start_all"))
         self.start_all_btn.setMinimumHeight(36)
         self.start_all_btn.clicked.connect(self.start_all)
-        self.stop_all_btn = QPushButton("■  停止全部相機")
+        self.stop_all_btn = QPushButton(tr("stop_all"))
         self.stop_all_btn.setMinimumHeight(36)
         self.stop_all_btn.clicked.connect(self.stop_all)
         ctrl_layout.addWidget(self.start_all_btn)
         ctrl_layout.addWidget(self.stop_all_btn)
-        left_layout.addWidget(ctrl_group)
+        left_layout.addWidget(self.ctrl_group)
 
         # 3. 全域串流參數
-        param_group = QGroupBox("⚙  全域串流參數")
-        param_layout = QVBoxLayout(param_group)
+        self.param_group = QGroupBox(tr("global_params"))
+        param_layout = QVBoxLayout(self.param_group)
         param_layout.setSpacing(6)
 
-        fps_lbl = QLabel("FPS 限制（每台）：")
-        fps_lbl.setStyleSheet("font-size:13px;")
-        param_layout.addWidget(fps_lbl)
+        self.fps_hdr_lbl = QLabel(tr("fps_limit"))
+        self.fps_hdr_lbl.setStyleSheet("font-size:13px;")
+        param_layout.addWidget(self.fps_hdr_lbl)
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(15)
@@ -835,9 +933,9 @@ class MainWindow(QMainWindow):
         param_layout.addWidget(self.fps_spin)
 
         # V4.0.1：靈敏度範圍 1~100，預設 5
-        thresh_lbl = QLabel("相減靈敏度 (Threshold)：")
-        thresh_lbl.setStyleSheet("font-size:13px;")
-        param_layout.addWidget(thresh_lbl)
+        self.thresh_hdr_lbl = QLabel(tr("threshold"))
+        self.thresh_hdr_lbl.setStyleSheet("font-size:13px;")
+        param_layout.addWidget(self.thresh_hdr_lbl)
         self.thresh_slider = QSlider(Qt.Horizontal)
         self.thresh_slider.setRange(1, 100)   # ← 修改：原為 5~255
         self.thresh_slider.setValue(5)        # ← 修改：預設 5
@@ -851,16 +949,16 @@ class MainWindow(QMainWindow):
         th_h.addWidget(self.thresh_lbl_val)
         param_layout.addLayout(th_h)
 
-        self.sub_all_btn = QPushButton("🔁  全部影像相減 ON/OFF")
+        self.sub_all_btn = QPushButton(tr("sub_all_off"))
         self.sub_all_btn.setCheckable(True)
         self.sub_all_btn.setMinimumHeight(34)
         self.sub_all_btn.clicked.connect(self._toggle_all_subtraction)
         param_layout.addWidget(self.sub_all_btn)
 
         # V4.0.1：全部重設背景按鈕
-        self.reset_all_bg_btn = QPushButton("🔄  全部重設背景快照")
+        self.reset_all_bg_btn = QPushButton(tr("reset_all_bg"))
         self.reset_all_bg_btn.setMinimumHeight(34)
-        self.reset_all_bg_btn.setToolTip("清除所有相機的背景快照，下一幀重新拍攝")
+        self.reset_all_bg_btn.setToolTip(tr("reset_all_bg_tip"))
         self.reset_all_bg_btn.clicked.connect(self._reset_all_backgrounds)
         param_layout.addWidget(self.reset_all_bg_btn)
 
@@ -869,9 +967,9 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("color:#2a2a45;")
         param_layout.addWidget(sep)
 
-        alert_hdr = QLabel("⚠  全域覆蓋率 Alert 閾值：")
-        alert_hdr.setStyleSheet("font-size:13px;")
-        param_layout.addWidget(alert_hdr)
+        self.alert_hdr_lbl = QLabel(tr("alert_hdr"))
+        self.alert_hdr_lbl.setStyleSheet("font-size:13px;")
+        param_layout.addWidget(self.alert_hdr_lbl)
         alert_h = QHBoxLayout()
         self.global_alert_spin = QDoubleSpinBox()
         self.global_alert_spin.setRange(0.0, 100.0)
@@ -880,25 +978,25 @@ class MainWindow(QMainWindow):
         self.global_alert_spin.setDecimals(1)
         self.global_alert_spin.setMinimumHeight(30)
         self.global_alert_spin.setStyleSheet("font-size:13px;")
-        self.global_alert_spin.setToolTip("套用到所有相機的預設 Alert 閾值")
+        self.global_alert_spin.setToolTip(tr("global_alert_tip"))
         self.global_alert_spin.valueChanged.connect(self._apply_global_alert)
-        apply_alert_btn = QPushButton("套用至全部")
-        apply_alert_btn.setFixedWidth(90)
-        apply_alert_btn.setMinimumHeight(30)
-        apply_alert_btn.clicked.connect(
+        self.apply_alert_btn = QPushButton(tr("apply_all"))
+        self.apply_alert_btn.setFixedWidth(90)
+        self.apply_alert_btn.setMinimumHeight(30)
+        self.apply_alert_btn.clicked.connect(
             lambda: self._apply_global_alert(self.global_alert_spin.value()))
         alert_h.addWidget(self.global_alert_spin)
-        alert_h.addWidget(apply_alert_btn)
+        alert_h.addWidget(self.apply_alert_btn)
         param_layout.addLayout(alert_h)
-        left_layout.addWidget(param_group)
+        left_layout.addWidget(self.param_group)
 
         # 4. 偵測到的設備
-        dev_group = QGroupBox("📋  偵測到的設備")
-        dev_layout = QVBoxLayout(dev_group)
+        self.dev_group = QGroupBox(tr("detected_dev"))
+        dev_layout = QVBoxLayout(self.dev_group)
         self.dev_list = QListWidget()
         self.dev_list.setStyleSheet("font-size:13px;")
         dev_layout.addWidget(self.dev_list)
-        left_layout.addWidget(dev_group)
+        left_layout.addWidget(self.dev_group)
 
         left_layout.addStretch()
         splitter.addWidget(left_widget)
@@ -962,6 +1060,49 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.tab_widget)
         splitter.addWidget(right_container)
         splitter.setSizes([320, 1600])
+
+    # ──────────────────────────────────────────────────────────
+    # 語言切換（🌐 一鍵中／英）
+    # ──────────────────────────────────────────────────────────
+    def _toggle_language(self):
+        global LANG
+        LANG = "en" if LANG == "zh" else "zh"
+        self._retranslate_ui()
+
+    def _retranslate_ui(self):
+        # 按鈕本身顯示「下一個」語言
+        self.lang_btn.setText("🌐 中" if LANG == "en" else "🌐 EN")
+        self.lang_btn.setToolTip(tr("lang_tip"))
+
+        self.setWindowTitle(tr("win_title"))
+
+        # 左側控制欄
+        self.hw_group.setTitle(tr("hw_monitor"))
+        self.ctrl_group.setTitle(tr("cam_control"))
+        self.enum_btn.setText(tr("refresh_dev"))
+        self.mode_lbl.setText(tr("compute_mode"))
+        if not HAS_CUDA:
+            self.cuda_radio.setToolTip(tr("cuda_na"))
+        self.start_all_btn.setText(tr("start_all"))
+        self.stop_all_btn.setText(tr("stop_all"))
+        self.param_group.setTitle(tr("global_params"))
+        self.fps_hdr_lbl.setText(tr("fps_limit"))
+        self.thresh_hdr_lbl.setText(tr("threshold"))
+        self.sub_all_btn.setText(
+            tr("sub_all_on") if self.sub_all_btn.isChecked() else tr("sub_all_off"))
+        self.reset_all_bg_btn.setText(tr("reset_all_bg"))
+        self.reset_all_bg_btn.setToolTip(tr("reset_all_bg_tip"))
+        self.alert_hdr_lbl.setText(tr("alert_hdr"))
+        self.global_alert_spin.setToolTip(tr("global_alert_tip"))
+        self.apply_alert_btn.setText(tr("apply_all"))
+        self.dev_group.setTitle(tr("detected_dev"))
+
+        # 串流台數
+        self.cam_cnt_lbl.setText(tr("streaming_n", n=len(self._cameras)))
+
+        # 每一格相機
+        for cw in self._cam_widgets:
+            cw.retranslate()
 
     # ──────────────────────────────────────────────────────────
     # 深色主題
@@ -1029,7 +1170,7 @@ class MainWindow(QMainWindow):
         self.device_list = MV_CC_DEVICE_INFO_LIST()
         ret = MvCamera.MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, self.device_list)
         if ret != 0:
-            QMessageBox.warning(self, "錯誤", f"列舉設備失敗，ret=0x{ret:08X}")
+            QMessageBox.warning(self, tr("err"), tr("enum_fail", ret=ret))
             return
 
         n = self.device_list.nDeviceNum
@@ -1064,7 +1205,7 @@ class MainWindow(QMainWindow):
             self.dev_list.addItem(f"[{i:02d}]  {label}")
 
         if n == 0:
-            self.dev_list.addItem("（未偵測到設備）")
+            self.dev_list.addItem(tr("no_device"))
             return
 
         while len(self._cam_labels) < MAX_CAMERAS:
@@ -1137,18 +1278,18 @@ class MainWindow(QMainWindow):
 
     def start_all(self):
         if self.cuda_radio.isChecked() and not HAS_CUDA:
-            QMessageBox.warning(self, "CUDA 錯誤", "未偵測到 CUDA，已自動切換至 CPU 模式")
+            QMessageBox.warning(self, tr("cuda_err"), tr("cuda_fallback"))
             self.cpu_radio.setChecked(True)
 
         n = min(self.device_list.nDeviceNum, MAX_CAMERAS)
         for i in range(n):
             self._open_camera(i)
-        self.cam_cnt_lbl.setText(f"串流中：{len(self._cameras)} 台")
+        self.cam_cnt_lbl.setText(tr("streaming_n", n=len(self._cameras)))
 
     def stop_all(self):
         for idx in list(self._cameras.keys()):
             self._close_camera(idx)
-        self.cam_cnt_lbl.setText("串流中：0 台")
+        self.cam_cnt_lbl.setText(tr("streaming_n", n=0))
 
     # ──────────────────────────────────────────────────────────
     # 影像接收
@@ -1167,11 +1308,10 @@ class MainWindow(QMainWindow):
             self._cameras[cam_id]["thread"].set_subtraction(enabled)
 
     def _toggle_all_subtraction(self, checked: bool):
-        self.sub_all_btn.setText(
-            "🔁  全部相減 ON" if checked else "🔁  全部影像相減 ON/OFF")
+        self.sub_all_btn.setText(tr("sub_all_on") if checked else tr("sub_all_off"))
         for cw in self._cam_widgets:
             cw.sub_btn.setChecked(checked)
-            cw.sub_btn.setText("相減 ON" if checked else "影像相減")
+            cw.sub_btn.setText(tr("sub_on") if checked else tr("subtract"))
             cw._sub_enabled = checked
             cw.diff_lbl.setVisible(checked)
             cam_id = cw.current_cam_id()
@@ -1218,7 +1358,7 @@ class MainWindow(QMainWindow):
         if self.monitor_thread.has_nvidia:
             self.gpu_lbl.setText(f"GPU:  {gpu}%")
             self.vram_lbl.setText(f"VRAM: {vram}")
-        self.cam_cnt_lbl.setText(f"串流中：{len(self._cameras)} 台")
+        self.cam_cnt_lbl.setText(tr("streaming_n", n=len(self._cameras)))
 
     # ──────────────────────────────────────────────────────────
     # 關閉事件
