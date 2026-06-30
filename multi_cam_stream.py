@@ -18,11 +18,16 @@ V4.0.1 修正：
 作者：Robert Lee  版本：V4.0.1
 """
 
+# ── 必須在 numpy / torch / cv2 等重量級函式庫之前設定 ──
+# 解決 PyTorch 與 OpenCV/MKL 各自帶 OpenMP runtime 造成的
+# 「OMP: Error #15: libiomp5md.dll already initialized」衝突（程式會直接結束）。
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import sys
 import threading
 import numpy as np
 import time
-import os
 import psutil
 import subprocess
 import platform
