@@ -138,15 +138,36 @@ def read_log(filepath: str, days: int):
 
 
 # -------------------------------------------------------
+# PyTorch（GPU 影像相減用）— 可選相依，沒裝就自動退回 CPU
+# -------------------------------------------------------
+try:
+    import torch
+    import torch.nn.functional as F
+    _HAS_TORCH = True
+except Exception:
+    _HAS_TORCH = False
+
+
+# -------------------------------------------------------
 # 工具函式：判斷 CUDA 是否可用
+#   改用 PyTorch 偵測（pip 版 OpenCV 不含 cv2.cuda）
 # -------------------------------------------------------
 def is_cuda_supported() -> bool:
     try:
-        return hasattr(cv2, 'cuda') and cv2.cuda.getCudaEnabledDeviceCount() > 0
+        return _HAS_TORCH and torch.cuda.is_available()
     except Exception:
         return False
 
 HAS_CUDA = is_cuda_supported()
+
+
+def _make_gaussian_kernel(ksize: int, device):
+    """建立與 cv2.GaussianBlur(ksize, sigma=0) 等效的 2D 高斯核（torch）。"""
+    sigma = 0.3 * ((ksize - 1) * 0.5 - 1) + 0.8     # OpenCV 預設 sigma 公式
+    ax = torch.arange(ksize, dtype=torch.float32, device=device) - (ksize - 1) / 2.0
+    g1d = torch.exp(-(ax ** 2) / (2.0 * sigma * sigma))
+    g1d = g1d / g1d.sum()
+    return torch.outer(g1d, g1d).reshape(1, 1, ksize, ksize)
 
 
 # ===============================================================
@@ -259,12 +280,12 @@ class CameraThread(QThread):
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
 
-        # CUDA 預配置
+        # GPU（PyTorch）預配置
         if self.use_cuda:
-            gpu_frame         = cv2.cuda_GpuMat()
-            gpu_bg_8u         = cv2.cuda_GpuMat()   # 凍結背景（uint8）
-            gaussian_filter   = cv2.cuda.createGaussianFilter(
-                cv2.CV_8UC1, cv2.CV_8UC1, (21, 21), 0)
+            gpu_device   = torch.device("cuda")
+            gpu_kernel   = _make_gaussian_kernel(21, gpu_device)  # 與 CPU 路徑同等模糊
+            gpu_pad      = 21 // 2
+            gpu_bg_t     = None    # 凍結背景張量（float32, GPU）
 
         while self.running:
             t0 = time.time()
@@ -303,19 +324,25 @@ class CameraThread(QThread):
                     frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
 
                     if self.use_cuda:
-                        # ── CUDA 路徑：靜態背景快照 ──────────────
-                        gpu_frame.upload(frame_gray_small)
-                        gpu_gray = gaussian_filter.apply(gpu_frame)
+                        # ── GPU 路徑（PyTorch）：靜態背景快照 ─────
+                        # 上傳灰階小圖 → GPU，做高斯模糊
+                        gpu_in  = torch.from_numpy(frame_gray_small).to(
+                            gpu_device, dtype=torch.float32).reshape(
+                            1, 1, proc_h, proc_w)
+                        gpu_in  = F.pad(gpu_in, (gpu_pad, gpu_pad, gpu_pad, gpu_pad),
+                                        mode="reflect")
+                        gpu_gray = F.conv2d(gpu_in, gpu_kernel)
 
                         if not self._cuda_bg_initialized:
                             # 第一幀凍結為靜態背景，之後不再更新
-                            gpu_gray.copyTo(gpu_bg_8u)
+                            gpu_bg_t = gpu_gray.clone()
                             self._cuda_bg_initialized = True
 
-                        gpu_diff = cv2.cuda.absdiff(gpu_bg_8u, gpu_gray)
-                        _, gpu_thresh = cv2.cuda.threshold(
-                            gpu_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
-                        thresh_res = gpu_thresh.download()
+                        gpu_diff   = (gpu_gray - gpu_bg_t).abs()
+                        gpu_thresh = (gpu_diff > self.diff_threshold).to(
+                            torch.uint8) * 255
+                        # 下載回 CPU 供後續形態學 / findContours
+                        thresh_res = gpu_thresh.reshape(proc_h, proc_w).cpu().numpy()
                     else:
                         # ── CPU 路徑：靜態背景快照 ───────────────
                         gray = cv2.GaussianBlur(frame_gray_small, (21, 21), 0)
