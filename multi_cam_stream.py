@@ -166,6 +166,46 @@ def is_cuda_supported() -> bool:
 HAS_CUDA = is_cuda_supported()
 
 
+def _enable_cuda_blocking_sync():
+    """把 CUDA 同步模式改為 blocking sync，避免 busy-wait 空轉。
+
+    PyTorch 呼叫 .cpu() / .item() 等待 GPU 完成時，CUDA runtime 預設會讓
+    CPU 自旋等待（spin-wait），等待期間該執行緒的 CPU 使用率會直接吃滿。
+    多台相機同時串流時，GPU 模式的 CPU 使用量反而比 CPU 模式高就是這個原因。
+    這裡在 CUDA context 建立前先設定 cudaDeviceScheduleBlockingSync，
+    讓等待 GPU 時執行緒真正進入睡眠、釋放 CPU。
+    """
+    try:
+        import ctypes
+        if platform.system() == "Windows":
+            candidates = ["cudart64_12.dll", "cudart64_121.dll",
+                          "cudart64_120.dll", "cudart64_110.dll",
+                          "cudart64_102.dll", "cudart64_101.dll"]
+        else:
+            candidates = ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]
+        libcudart = None
+        for name in candidates:
+            try:
+                libcudart = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if libcudart is None:
+            return
+        cudaDeviceScheduleBlockingSync = 0x04
+        libcudart.cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)
+    except Exception:
+        pass
+
+
+if HAS_CUDA:
+    # 必須在任何 CUDA context 建立（第一次 tensor 上 GPU）之前呼叫
+    _enable_cuda_blocking_sync()
+    # GPU 模式下 torch 只負責發 kernel，不需要 intra-op 執行緒池
+    # （預設會依 CPU 核心數開執行緒，20 台相機時徒增排程負擔）
+    torch.set_num_threads(1)
+
+
 def _make_gaussian_kernel(ksize: int, device):
     """建立與 cv2.GaussianBlur(ksize, sigma=0) 等效的 2D 高斯核（torch）。"""
     sigma = 0.3 * ((ksize - 1) * 0.5 - 1) + 0.8     # OpenCV 預設 sigma 公式
@@ -173,18 +213,6 @@ def _make_gaussian_kernel(ksize: int, device):
     g1d = torch.exp(-(ax ** 2) / (2.0 * sigma * sigma))
     g1d = g1d / g1d.sum()
     return torch.outer(g1d, g1d).reshape(1, 1, ksize, ksize)
-
-
-def _make_morph_kernel(ksize: int, device):
-    """建立形態學橢圓核（模擬 cv2.getStructuringElement MORPH_ELLIPSE）。"""
-    r = ksize // 2
-    y, x = torch.meshgrid(
-        torch.arange(ksize, device=device) - r,
-        torch.arange(ksize, device=device) - r,
-        indexing='ij'
-    )
-    mask = ((x.float() / max(r, 1)) ** 2 + (y.float() / max(r, 1)) ** 2 <= 1.0)
-    return mask.float().reshape(1, 1, ksize, ksize)
 
 
 # ===============================================================
@@ -297,14 +325,24 @@ class CameraThread(QThread):
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
 
-        # GPU（PyTorch）預配置 —— 所有核心在此一次建立，避免每幀重建
+        # GPU（PyTorch）預配置 —— 所有核心/緩衝在此一次建立，避免每幀重建
         if self.use_cuda:
             gpu_device    = torch.device("cuda")
             gpu_kernel    = _make_gaussian_kernel(21, gpu_device)  # 高斯模糊核
             gpu_pad       = 21 // 2
-            morph_kernel  = _make_morph_kernel(5, gpu_device)      # 形態學橢圓核
             morph_pad     = 5 // 2
             gpu_bg_t      = None    # 凍結背景張量（float32, GPU）
+
+            # 固定處理尺寸的預配置緩衝：
+            #   pinned（page-locked）記憶體讓 H2D/D2H 傳輸走 DMA，
+            #   不必每幀重新配置、也不經過 pageable 暫存複製
+            proc_w0, proc_h0 = 640, 480
+            pinned_in  = torch.empty((1, 1, proc_h0, proc_w0),
+                                     dtype=torch.float32, pin_memory=True)
+            gpu_in_buf = torch.empty((1, 1, proc_h0, proc_w0),
+                                     dtype=torch.float32, device=gpu_device)
+            pinned_out = torch.empty((proc_h0, proc_w0),
+                                     dtype=torch.uint8, pin_memory=True)
 
         while self.running:
             t0 = time.time()
@@ -343,58 +381,63 @@ class CameraThread(QThread):
                     frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
 
                     if self.use_cuda:
-                        # ── GPU 完整路徑（PyTorch）：所有步驟留在 GPU ────────────────
-                        # ① 上傳灰階小圖 → GPU，做高斯模糊
-                        gpu_in   = torch.from_numpy(frame_gray_small).to(
-                            gpu_device, dtype=torch.float32).reshape(1, 1, proc_h, proc_w)
-                        gpu_in   = F.pad(gpu_in, (gpu_pad,)*4, mode="reflect")
-                        gpu_gray = F.conv2d(gpu_in, gpu_kernel)          # [1,1,H,W] float32
+                        # ── GPU 路徑（PyTorch）────────────────────────────────
+                        # CPU 使用量優化重點：
+                        #   - inference_mode 關掉 autograd 的每運算子額外開銷
+                        #   - pinned buffer + non_blocking 上傳，不每幀重新配置
+                        #   - 整幀只有「最後下載 mask」一個同步點
+                        #     （原本 .item() + 兩次 .cpu() 共 3 個同步點，
+                        #       每個同步 CPU 都得等 GPU，等越多次燒越多 CPU）
+                        with torch.inference_mode():
+                            # ① 灰階小圖 → pinned buffer → GPU，做高斯模糊
+                            pinned_in.copy_(torch.from_numpy(
+                                frame_gray_small).reshape(1, 1, proc_h, proc_w))
+                            gpu_in_buf.copy_(pinned_in, non_blocking=True)
+                            gpu_in   = F.pad(gpu_in_buf, (gpu_pad,)*4, mode="reflect")
+                            gpu_gray = F.conv2d(gpu_in, gpu_kernel)      # [1,1,H,W] float32
 
-                        # ② 凍結背景（第一幀快照）
-                        if not self._cuda_bg_initialized:
-                            gpu_bg_t = gpu_gray.clone()
-                            self._cuda_bg_initialized = True
+                            # ② 凍結背景（第一幀快照）
+                            if not self._cuda_bg_initialized:
+                                gpu_bg_t = gpu_gray.clone()
+                                self._cuda_bg_initialized = True
 
-                        # ③ GPU 上做絕對差值 + threshold → bool mask
-                        gpu_diff   = (gpu_gray - gpu_bg_t).abs()         # [1,1,H,W]
-                        gpu_thresh = (gpu_diff > self.diff_threshold).to(torch.float32)  # 0/1
+                            # ③ GPU 上做絕對差值 + threshold → bool mask
+                            gpu_diff   = (gpu_gray - gpu_bg_t).abs()     # [1,1,H,W]
+                            gpu_thresh = (gpu_diff > self.diff_threshold).to(torch.float32)
 
-                        # ④ GPU 上做形態學 CLOSE（先 dilate 再 erode）
-                        #    用 max-pooling 模擬 dilation，min-pooling 模擬 erosion
-                        mp = morph_pad
-                        # dilation（max pool）
-                        dilated = F.max_pool2d(
-                            gpu_thresh, kernel_size=5, stride=1, padding=mp)
-                        # erosion = 1 - dilation(1 - x)
-                        closed  = 1.0 - F.max_pool2d(
-                            1.0 - dilated, kernel_size=5, stride=1, padding=mp)
+                            # ④ GPU 上做形態學 CLOSE（先 dilate 再 erode）
+                            #    用 max-pooling 模擬 dilation，min-pooling 模擬 erosion
+                            mp = morph_pad
+                            dilated = F.max_pool2d(
+                                gpu_thresh, kernel_size=5, stride=1, padding=mp)
+                            closed  = 1.0 - F.max_pool2d(
+                                1.0 - dilated, kernel_size=5, stride=1, padding=mp)
 
-                        # ⑤ GPU 上做形態學 OPEN（先 erode 再 dilate）
-                        eroded  = 1.0 - F.max_pool2d(
-                            1.0 - closed, kernel_size=5, stride=1, padding=mp)
-                        cleaned_t = F.max_pool2d(
-                            eroded, kernel_size=5, stride=1, padding=mp)  # [1,1,H,W] 0/1
+                            # ⑤ GPU 上做形態學 OPEN（先 erode 再 dilate）
+                            eroded  = 1.0 - F.max_pool2d(
+                                1.0 - closed, kernel_size=5, stride=1, padding=mp)
+                            cleaned_t = F.max_pool2d(
+                                eroded, kernel_size=5, stride=1, padding=mp)  # 0/1
 
-                        # ⑥ GPU 上計算覆蓋率
+                            # ⑥ 下載 mask 回 CPU —— 唯一同步點
+                            cleaned_u8 = (cleaned_t.squeeze() * 255).to(torch.uint8)
+                            pinned_out.copy_(cleaned_u8, non_blocking=True)
+                            torch.cuda.synchronize()
+                        thresh_res = pinned_out.numpy().copy()           # uint8 [H,W]
+
+                        # ⑦ 覆蓋率直接在 CPU 端從 mask 統計（免 .item() 同步）
                         total_pixels   = proc_h * proc_w
-                        covered_pixels = cleaned_t.sum().item()           # scalar，只傳一個數
+                        covered_pixels = cv2.countNonZero(thresh_res)
                         coverage_pct   = (covered_pixels / total_pixels * 100.0) \
                                          if total_pixels > 0 else 0.0
 
-                        # ⑦ 製作 diff display frame（全在 GPU，最後才一次 download）
-                        #    cleaned_t → uint8 [H,W] on GPU
-                        cleaned_u8 = (cleaned_t.squeeze() * 255).to(torch.uint8)  # [H,W]
-                        # 轉成偽彩色：diff 區域為綠色 (BGR: 0,255,100)
-                        r_ch = torch.zeros_like(cleaned_u8)
-                        g_ch = cleaned_u8
-                        b_ch = (cleaned_u8.float() * (100 / 255)).to(torch.uint8)
-                        diff_gpu = torch.stack([b_ch, g_ch, r_ch], dim=2)  # [H,W,3]
+                        # ⑧ 偽彩色顯示圖在 CPU 端合成（640x480 uint8 極便宜，
+                        #    比在 GPU 上多發 3 個 kernel + 額外下載一張彩圖划算）
+                        diff_display = np.zeros((proc_h, proc_w, 3), dtype=np.uint8)
+                        mask_on = thresh_res > 0
+                        diff_display[mask_on] = (100, 255, 0)            # BGR 綠色
 
-                        # ⑧ 一次性下載回 CPU（只搬顯示用的小圖 + 一個 float）
-                        thresh_res   = cleaned_u8.cpu().numpy()            # 給 findContours 用
-                        diff_display = diff_gpu.cpu().numpy().copy()       # BGR uint8
-
-                        # ⑨ 在 CPU 端只做最終的輪廓繪製（純繪圖，不影響覆蓋率）
+                        # ⑨ 最終輪廓繪製（純繪圖，不影響覆蓋率）
                         contours, _ = cv2.findContours(
                             thresh_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                         cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
