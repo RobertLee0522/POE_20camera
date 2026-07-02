@@ -35,8 +35,8 @@ def ToHexStr(num):
 
 if __name__ == "__main__":
 
-    # ch:初始化SDK | en: initialize SDK
-    MvCamera.MV_CC_Initialize()
+    # ch:初始化SDK (Python SDK 不需要/不支援此調用) | en: initialize SDK (Not required/supported in Python SDK)
+    # MvCamera.MV_CC_Initialize()
 
     global deviceList
     deviceList = MV_CC_DEVICE_INFO_LIST()
@@ -370,7 +370,7 @@ if __name__ == "__main__":
 
     close_device()
 
-    # ch:反初始化SDK | en: finalize SDK
-    MvCamera.MV_CC_Finalize()
+    # ch:反初始化SDK (Python SDK 不需要/不支援此調用) | en: finalize SDK (Not required/supported in Python SDK)
+    # MvCamera.MV_CC_Finalize()
 
     sys.exit()

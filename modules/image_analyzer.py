@@ -107,16 +107,16 @@ class ImageAnalyzer:
             - S: 0-100 百分比
             - L: 0-100 百分比
         """
-        # 轉換 BGR → HSV (OpenCV 只支援 HSV)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # 轉換 BGR → HLS (OpenCV 支援 HLS，即 Hue, Lightness, Saturation)
+        hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
         
-        h_avg = float(hsv[:, :, 0].mean())  # 0-180
-        s_avg = float(hsv[:, :, 1].mean())  # 0-255
-        v_avg = float(hsv[:, :, 2].mean())  # 0-255
+        h_avg = float(hls[:, :, 0].mean())  # 0-180
+        l_avg = float(hls[:, :, 1].mean())  # 0-255
+        s_avg = float(hls[:, :, 2].mean())  # 0-255
         
-        # 將 S, V 轉換為百分比 (0-100)
+        # 將 L, S 轉換為百分比 (0-100)
+        l_percent = (l_avg / 255.0) * 100.0
         s_percent = (s_avg / 255.0) * 100.0
-        l_percent = (v_avg / 255.0) * 100.0
         
         return (h_avg, s_percent, l_percent)
     

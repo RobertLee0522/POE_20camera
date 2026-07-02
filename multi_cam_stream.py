@@ -175,6 +175,18 @@ def _make_gaussian_kernel(ksize: int, device):
     return torch.outer(g1d, g1d).reshape(1, 1, ksize, ksize)
 
 
+def _make_morph_kernel(ksize: int, device):
+    """建立形態學橢圓核（模擬 cv2.getStructuringElement MORPH_ELLIPSE）。"""
+    r = ksize // 2
+    y, x = torch.meshgrid(
+        torch.arange(ksize, device=device) - r,
+        torch.arange(ksize, device=device) - r,
+        indexing='ij'
+    )
+    mask = ((x.float() / max(r, 1)) ** 2 + (y.float() / max(r, 1)) ** 2 <= 1.0)
+    return mask.float().reshape(1, 1, ksize, ksize)
+
+
 # ===============================================================
 # MonitorThread：硬體狀態監控執行緒
 #   - 定期背景讀取 CPU/RAM/GPU，避免阻塞主 UI 執行緒
@@ -285,12 +297,14 @@ class CameraThread(QThread):
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
 
-        # GPU（PyTorch）預配置
+        # GPU（PyTorch）預配置 —— 所有核心在此一次建立，避免每幀重建
         if self.use_cuda:
-            gpu_device   = torch.device("cuda")
-            gpu_kernel   = _make_gaussian_kernel(21, gpu_device)  # 與 CPU 路徑同等模糊
-            gpu_pad      = 21 // 2
-            gpu_bg_t     = None    # 凍結背景張量（float32, GPU）
+            gpu_device    = torch.device("cuda")
+            gpu_kernel    = _make_gaussian_kernel(21, gpu_device)  # 高斯模糊核
+            gpu_pad       = 21 // 2
+            morph_kernel  = _make_morph_kernel(5, gpu_device)      # 形態學橢圓核
+            morph_pad     = 5 // 2
+            gpu_bg_t      = None    # 凍結背景張量（float32, GPU）
 
         while self.running:
             t0 = time.time()
@@ -329,25 +343,64 @@ class CameraThread(QThread):
                     frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
 
                     if self.use_cuda:
-                        # ── GPU 路徑（PyTorch）：靜態背景快照 ─────
-                        # 上傳灰階小圖 → GPU，做高斯模糊
-                        gpu_in  = torch.from_numpy(frame_gray_small).to(
-                            gpu_device, dtype=torch.float32).reshape(
-                            1, 1, proc_h, proc_w)
-                        gpu_in  = F.pad(gpu_in, (gpu_pad, gpu_pad, gpu_pad, gpu_pad),
-                                        mode="reflect")
-                        gpu_gray = F.conv2d(gpu_in, gpu_kernel)
+                        # ── GPU 完整路徑（PyTorch）：所有步驟留在 GPU ────────────────
+                        # ① 上傳灰階小圖 → GPU，做高斯模糊
+                        gpu_in   = torch.from_numpy(frame_gray_small).to(
+                            gpu_device, dtype=torch.float32).reshape(1, 1, proc_h, proc_w)
+                        gpu_in   = F.pad(gpu_in, (gpu_pad,)*4, mode="reflect")
+                        gpu_gray = F.conv2d(gpu_in, gpu_kernel)          # [1,1,H,W] float32
 
+                        # ② 凍結背景（第一幀快照）
                         if not self._cuda_bg_initialized:
-                            # 第一幀凍結為靜態背景，之後不再更新
                             gpu_bg_t = gpu_gray.clone()
                             self._cuda_bg_initialized = True
 
-                        gpu_diff   = (gpu_gray - gpu_bg_t).abs()
-                        gpu_thresh = (gpu_diff > self.diff_threshold).to(
-                            torch.uint8) * 255
-                        # 下載回 CPU 供後續形態學 / findContours
-                        thresh_res = gpu_thresh.reshape(proc_h, proc_w).cpu().numpy()
+                        # ③ GPU 上做絕對差值 + threshold → bool mask
+                        gpu_diff   = (gpu_gray - gpu_bg_t).abs()         # [1,1,H,W]
+                        gpu_thresh = (gpu_diff > self.diff_threshold).to(torch.float32)  # 0/1
+
+                        # ④ GPU 上做形態學 CLOSE（先 dilate 再 erode）
+                        #    用 max-pooling 模擬 dilation，min-pooling 模擬 erosion
+                        mp = morph_pad
+                        # dilation（max pool）
+                        dilated = F.max_pool2d(
+                            gpu_thresh, kernel_size=5, stride=1, padding=mp)
+                        # erosion = 1 - dilation(1 - x)
+                        closed  = 1.0 - F.max_pool2d(
+                            1.0 - dilated, kernel_size=5, stride=1, padding=mp)
+
+                        # ⑤ GPU 上做形態學 OPEN（先 erode 再 dilate）
+                        eroded  = 1.0 - F.max_pool2d(
+                            1.0 - closed, kernel_size=5, stride=1, padding=mp)
+                        cleaned_t = F.max_pool2d(
+                            eroded, kernel_size=5, stride=1, padding=mp)  # [1,1,H,W] 0/1
+
+                        # ⑥ GPU 上計算覆蓋率
+                        total_pixels   = proc_h * proc_w
+                        covered_pixels = cleaned_t.sum().item()           # scalar，只傳一個數
+                        coverage_pct   = (covered_pixels / total_pixels * 100.0) \
+                                         if total_pixels > 0 else 0.0
+
+                        # ⑦ 製作 diff display frame（全在 GPU，最後才一次 download）
+                        #    cleaned_t → uint8 [H,W] on GPU
+                        cleaned_u8 = (cleaned_t.squeeze() * 255).to(torch.uint8)  # [H,W]
+                        # 轉成偽彩色：diff 區域為綠色 (BGR: 0,255,100)
+                        r_ch = torch.zeros_like(cleaned_u8)
+                        g_ch = cleaned_u8
+                        b_ch = (cleaned_u8.float() * (100 / 255)).to(torch.uint8)
+                        diff_gpu = torch.stack([b_ch, g_ch, r_ch], dim=2)  # [H,W,3]
+
+                        # ⑧ 一次性下載回 CPU（只搬顯示用的小圖 + 一個 float）
+                        thresh_res   = cleaned_u8.cpu().numpy()            # 給 findContours 用
+                        diff_display = diff_gpu.cpu().numpy().copy()       # BGR uint8
+
+                        # ⑨ 在 CPU 端只做最終的輪廓繪製（純繪圖，不影響覆蓋率）
+                        contours, _ = cv2.findContours(
+                            thresh_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
+                        cv2.putText(diff_display, f"Coverage: {coverage_pct:.1f}%",
+                                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 255), 2)
+
                     else:
                         # ── CPU 路徑：靜態背景快照 ───────────────
                         gray = cv2.GaussianBlur(frame_gray_small, (21, 21), 0)
@@ -360,22 +413,22 @@ class CameraThread(QThread):
                         _, thresh_res = cv2.threshold(
                             frame_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
 
-                    # ── Contour 覆蓋率計算 ─────────────────────
-                    kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                    cleaned = cv2.morphologyEx(thresh_res, cv2.MORPH_CLOSE, kernel)
-                    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,  kernel)
+                        # ── Contour 覆蓋率計算 ─────────────────────
+                        kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                        cleaned = cv2.morphologyEx(thresh_res, cv2.MORPH_CLOSE, kernel)
+                        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,  kernel)
 
-                    contours, _ = cv2.findContours(
-                        cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        contours, _ = cv2.findContours(
+                            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-                    total_pixels   = thresh_res.shape[0] * thresh_res.shape[1]
-                    covered_pixels = sum(cv2.contourArea(c) for c in contours)
-                    coverage_pct   = (covered_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0
+                        total_pixels   = thresh_res.shape[0] * thresh_res.shape[1]
+                        covered_pixels = sum(cv2.contourArea(c) for c in contours)
+                        coverage_pct   = (covered_pixels / total_pixels * 100.0) if total_pixels > 0 else 0.0
 
-                    diff_display = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
-                    cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
-                    cv2.putText(diff_display, f"Coverage: {coverage_pct:.1f}%",
-                                (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 255), 2)
+                        diff_display = cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+                        cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
+                        cv2.putText(diff_display, f"Coverage: {coverage_pct:.1f}%",
+                                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 255), 2)
                 else:
                     diff_display = np.zeros_like(frame_bgr)
                     cv2.putText(diff_display, "Subtraction OFF",
@@ -1583,6 +1636,9 @@ class MainWindow(QMainWindow):
     def stop_all(self):
         for idx in list(self._cameras.keys()):
             self._close_camera(idx)
+        # Force-clear ALL widget slots so no stale frame remains visible
+        for cw in self._cam_widgets:
+            cw.set_disconnected()
         self.cam_cnt_lbl.setText(tr("streaming_n", n=0))
 
     # ──────────────────────────────────────────────────────────
@@ -1590,6 +1646,10 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────
     def _on_frame_ready(self, cam_id: int, bgr: np.ndarray,
                         diff: np.ndarray, coverage: float):
+        # Guard: ignore frames that arrive after the camera has been closed.
+        # Qt queues signals, so a few frames can arrive even after stop().
+        if cam_id not in self._cameras:
+            return
         slot = self._get_slot_for_cam(cam_id)
         if 0 <= slot < len(self._cam_widgets):
             self._cam_widgets[slot].update_frames(bgr, diff, coverage)
