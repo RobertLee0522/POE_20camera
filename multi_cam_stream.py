@@ -26,6 +26,7 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import sys
 import threading
+import queue
 import numpy as np
 import time
 import psutil
@@ -237,74 +238,18 @@ class MonitorThread(QThread):
 class CameraThread(QThread):
     frame_ready = pyqtSignal(int, np.ndarray, np.ndarray, float)
 
-    def __init__(self, cam_obj, cam_id: int, use_cuda: bool = False, parent=None):
+    def __init__(self, cam_obj, cam_id: int, use_cuda: bool = False, gpu_processor=None, parent=None):
         super().__init__(parent)
         self.cam      = cam_obj
         self.cam_id   = cam_id
         self.use_cuda = use_cuda
+        self.gpu_processor = gpu_processor
 
         self.running = True
         self.target_fps     = 15
-        self.diff_threshold = 5     # V4.0.1：預設值改為 5
-
-        self._subtraction_enabled = False
-        self._lock = threading.Lock()
-
-        # V4.0.1：bg_frame 凍結為靜態快照（uint8），不再持續 accumulateWeighted
-        self.bg_frame: Optional[np.ndarray] = None
-
-        # CUDA 背景快照旗標
-        self._cuda_bg_initialized = False
-
-    # ─────────────────────────────────────────────────────
-    # 啟用 / 停用影像相減
-    #   停用時清除背景快照，下次啟用重新拍攝第一幀
-    # ─────────────────────────────────────────────────────
-    def set_subtraction(self, enabled: bool):
-        with self._lock:
-            self._subtraction_enabled = enabled
-        if not enabled:
-            self._reset_background()
-
-    def get_subtraction(self) -> bool:
-        with self._lock:
-            return self._subtraction_enabled
-
-    # ─────────────────────────────────────────────────────
-    # 重設背景快照（供外部呼叫，例如按下「重設背景」按鈕）
-    # ─────────────────────────────────────────────────────
-    def reset_background(self):
-        self._reset_background()
-
-    def _reset_background(self):
-        """清除背景，下一幀到來時自動重新凍結快照。"""
-        self.bg_frame = None
-        self._cuda_bg_initialized = False
-
-    def run(self):
-        stFrameInfo   = MV_FRAME_OUT_INFO_EX()
-        stPayloadSize = MVCC_INTVALUE_EX()
-
-        ret = self.cam.MV_CC_GetIntValueEx("PayloadSize", stPayloadSize)
-        if ret != 0:
-            print(f"[Cam {self.cam_id}] 無法獲取 PayloadSize")
-            return
-
-        nPayloadSize = stPayloadSize.nCurValue
-        pData = (c_ubyte * nPayloadSize)()
-
-        # 預先配置 RGB 轉換記憶體（Payload * 3 = 足夠 BGR8）
+        self.diff_threshold = 5          # 預先配置 RGB 轉換記憶體（Payload * 3 = 足夠 BGR8）
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
-
-        # GPU（PyTorch）預配置 —— 所有核心在此一次建立，避免每幀重建
-        if self.use_cuda:
-            gpu_device    = torch.device("cuda")
-            gpu_kernel    = _make_gaussian_kernel(21, gpu_device)  # 高斯模糊核
-            gpu_pad       = 21 // 2
-            morph_kernel  = _make_morph_kernel(5, gpu_device)      # 形態學橢圓核
-            morph_pad     = 5 // 2
-            gpu_bg_t      = None    # 凍結背景張量（float32, GPU）
 
         while self.running:
             t0 = time.time()
@@ -335,85 +280,27 @@ class CameraThread(QThread):
                 frame_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 
                 do_sub = self.get_subtraction()
-                coverage_pct = 0.0
 
-                if do_sub:
-                    # 縮小影像以節省運算資源
+                if self.use_cuda:
+                    # GPU 模式下，全部委託給 centralized GPUBatchProcessor，避免多線程 CUDA 衝突與 GIL 競爭
                     proc_w, proc_h = 640, 480
                     frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
-
-                    if self.use_cuda:
-                        # ── GPU 完整路徑（PyTorch）：所有步驟留在 GPU ────────────────
-                        # ① 上傳灰階小圖 → GPU，做高斯模糊
-                        gpu_in   = torch.from_numpy(frame_gray_small).to(
-                            gpu_device, dtype=torch.float32).reshape(1, 1, proc_h, proc_w)
-                        gpu_in   = F.pad(gpu_in, (gpu_pad,)*4, mode="reflect")
-                        gpu_gray = F.conv2d(gpu_in, gpu_kernel)          # [1,1,H,W] float32
-
-                        # ② 凍結背景（第一幀快照）
-                        if not self._cuda_bg_initialized:
-                            gpu_bg_t = gpu_gray.clone()
-                            self._cuda_bg_initialized = True
-
-                        # ③ GPU 上做絕對差值 + threshold → bool mask
-                        gpu_diff   = (gpu_gray - gpu_bg_t).abs()         # [1,1,H,W]
-                        gpu_thresh = (gpu_diff > self.diff_threshold).to(torch.float32)  # 0/1
-
-                        # ④ GPU 上做形態學 CLOSE（先 dilate 再 erode）
-                        #    用 max-pooling 模擬 dilation，min-pooling 模擬 erosion
-                        mp = morph_pad
-                        # dilation（max pool）
-                        dilated = F.max_pool2d(
-                            gpu_thresh, kernel_size=5, stride=1, padding=mp)
-                        # erosion = 1 - dilation(1 - x)
-                        closed  = 1.0 - F.max_pool2d(
-                            1.0 - dilated, kernel_size=5, stride=1, padding=mp)
-
-                        # ⑤ GPU 上做形態學 OPEN（先 erode 再 dilate）
-                        eroded  = 1.0 - F.max_pool2d(
-                            1.0 - closed, kernel_size=5, stride=1, padding=mp)
-                        cleaned_t = F.max_pool2d(
-                            eroded, kernel_size=5, stride=1, padding=mp)  # [1,1,H,W] 0/1
-
-                        # ⑥ GPU 上計算覆蓋率
-                        total_pixels   = proc_h * proc_w
-                        covered_pixels = cleaned_t.sum().item()           # scalar，只傳一個數
-                        coverage_pct   = (covered_pixels / total_pixels * 100.0) \
-                                         if total_pixels > 0 else 0.0
-
-                        # ⑦ 製作 diff display frame（全在 GPU，最後才一次 download）
-                        #    cleaned_t → uint8 [H,W] on GPU
-                        cleaned_u8 = (cleaned_t.squeeze() * 255).to(torch.uint8)  # [H,W]
-                        # 轉成偽彩色：diff 區域為綠色 (BGR: 0,255,100)
-                        r_ch = torch.zeros_like(cleaned_u8)
-                        g_ch = cleaned_u8
-                        b_ch = (cleaned_u8.float() * (100 / 255)).to(torch.uint8)
-                        diff_gpu = torch.stack([b_ch, g_ch, r_ch], dim=2)  # [H,W,3]
-
-                        # ⑧ 一次性下載回 CPU（只搬顯示用的小圖 + 一個 float）
-                        thresh_res   = cleaned_u8.cpu().numpy()            # 給 findContours 用
-                        diff_display = diff_gpu.cpu().numpy().copy()       # BGR uint8
-
-                        # ⑨ 在 CPU 端只做最終的輪廓繪製（純繪圖，不影響覆蓋率）
-                        contours, _ = cv2.findContours(
-                            thresh_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
-                        cv2.putText(diff_display, f"Coverage: {coverage_pct:.1f}%",
-                                    (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 255), 2)
-
-                    else:
-                        # ── CPU 路徑：靜態背景快照 ───────────────
+                    self.gpu_processor.add_frame(self.cam_id, frame_bgr.copy(), frame_gray_small, self.diff_threshold, do_sub)
+                else:
+                    # CPU 模式下，各自線程在 CPU 運行 OpenCV
+                    coverage_pct = 0.0
+                    if do_sub:
+                        proc_w, proc_h = 640, 480
+                        frame_gray_small = cv2.resize(frame_gray, (proc_w, proc_h))
                         gray = cv2.GaussianBlur(frame_gray_small, (21, 21), 0)
 
                         if self.bg_frame is None or self.bg_frame.shape != gray.shape:
-                            # 第一幀凍結為靜態背景 uint8，之後不再更新
                             self.bg_frame = gray.copy()
 
                         frame_diff = cv2.absdiff(self.bg_frame, gray)
                         _, thresh_res = cv2.threshold(
                             frame_diff, self.diff_threshold, 255, cv2.THRESH_BINARY)
 
-                        # ── Contour 覆蓋率計算 ─────────────────────
                         kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
                         cleaned = cv2.morphologyEx(thresh_res, cv2.MORPH_CLOSE, kernel)
                         cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN,  kernel)
@@ -429,14 +316,14 @@ class CameraThread(QThread):
                         cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
                         cv2.putText(diff_display, f"Coverage: {coverage_pct:.1f}%",
                                     (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 255), 2)
-                else:
-                    diff_display = np.zeros_like(frame_bgr)
-                    cv2.putText(diff_display, "Subtraction OFF",
-                                (10, frame_bgr.shape[0] // 2),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 80), 2)
+                    else:
+                        diff_display = np.zeros_like(frame_bgr)
+                        cv2.putText(diff_display, "Subtraction OFF",
+                                    (10, frame_bgr.shape[0] // 2),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 80), 2)
 
-                self.frame_ready.emit(
-                    self.cam_id, frame_bgr.copy(), diff_display.copy(), coverage_pct)
+                    self.frame_ready.emit(
+                        self.cam_id, frame_bgr.copy(), diff_display.copy(), coverage_pct)
 
             elapsed = time.time() - t0
             sleep_t = max(1.0 / self.target_fps - elapsed, 0)
@@ -1128,6 +1015,156 @@ class CameraWidget(QFrame):
 
 
 # ===============================================================
+# GPUBatchProcessor：集中式 GPU 批次處理器 (QThread)
+# ===============================================================
+class GPUBatchProcessor(QThread):
+    frame_processed = pyqtSignal(int, np.ndarray, np.ndarray, float)  # cam_id, bgr, diff, coverage
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.queue = queue.Queue()
+        self.running = False
+        self.gpu_bg_frames = {}  # cam_id -> tensor (float32, GPU)
+
+    def add_frame(self, cam_id: int, frame_bgr: np.ndarray, frame_gray_small: np.ndarray, threshold: int, do_sub: bool):
+        if self.running:
+            self.queue.put((cam_id, frame_bgr, frame_gray_small, threshold, do_sub))
+
+    def reset_background(self, cam_id: int):
+        if cam_id in self.gpu_bg_frames:
+            self.gpu_bg_frames[cam_id] = None
+
+    def clear_all_backgrounds(self):
+        self.gpu_bg_frames.clear()
+
+    def start(self):
+        self.running = True
+        self.clear_all_backgrounds()
+        super().start()
+
+    def stop(self):
+        self.running = False
+        # Push a dummy item to wake up the queue get loop if blocked
+        self.queue.put(None)
+        self.wait()
+
+    def run(self):
+        gpu_device = torch.device("cuda")
+        
+        # 預先建立核心
+        gpu_kernel = _make_gaussian_kernel(21, gpu_device)
+        gpu_pad = 21 // 2
+        morph_pad = 5 // 2
+        
+        while self.running:
+            try:
+                # 1. 取得第一個項目（阻塞式）
+                item = self.queue.get(timeout=0.05)
+                if item is None:  # Stop signal wake up
+                    continue
+            except queue.Empty:
+                continue
+
+            items = [item]
+            
+            # 2. 收集當前佇列中所有立即可得的項目，最大批次 20
+            while len(items) < 20:
+                try:
+                    next_item = self.queue.get_nowait()
+                    if next_item is None:
+                        continue
+                    items.append(next_item)
+                except queue.Empty:
+                    break
+
+            # 3. 分離需要影像相減 (do_sub) 與不需要的項目
+            sub_items = []
+            for it in items:
+                cam_id, frame_bgr, frame_gray_small, threshold, do_sub = it
+                if do_sub:
+                    sub_items.append(it)
+                else:
+                    # 無需相減，直接在 CPU 端生成空白結果並送出
+                    diff_display = np.zeros_like(frame_bgr)
+                    cv2.putText(diff_display, "Subtraction OFF",
+                                (10, frame_bgr.shape[0] // 2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (80, 80, 80), 2)
+                    self.frame_processed.emit(cam_id, frame_bgr, diff_display, 0.0)
+
+            if not sub_items:
+                continue
+
+            n_sub = len(sub_items)
+            proc_h, proc_w = 480, 640
+
+            # 4. 將多台相機的灰階小圖合併為一個 numpy 批次陣列，一次上傳 GPU
+            batch_np = np.empty((n_sub, proc_h, proc_w), dtype=np.uint8)
+            for idx, (_, _, frame_gray_small, _, _) in enumerate(sub_items):
+                batch_np[idx] = frame_gray_small
+
+            with torch.inference_mode():
+                # 轉成 tensor 並上傳至 GPU [N, 1, H, W]
+                gpu_in_batch = torch.from_numpy(batch_np).to(gpu_device, dtype=torch.float32).unsqueeze(1)
+                
+                # 批次高斯模糊
+                gpu_in_padded = F.pad(gpu_in_batch, (gpu_pad,)*4, mode="reflect")
+                gpu_gray_batch = F.conv2d(gpu_in_padded, gpu_kernel)
+
+                # 批次背景快照處理
+                bg_tensors = []
+                for idx, (cam_id, _, _, _, _) in enumerate(sub_items):
+                    single_gray = gpu_gray_batch[idx:idx+1]  # [1, 1, H, W]
+                    
+                    if cam_id not in self.gpu_bg_frames or self.gpu_bg_frames[cam_id] is None:
+                        self.gpu_bg_frames[cam_id] = single_gray.clone()
+                        
+                    bg_tensors.append(self.gpu_bg_frames[cam_id])
+
+                gpu_bg_batch = torch.cat(bg_tensors, dim=0)  # [N, 1, H, W]
+
+                # 絕對值差值
+                gpu_diff = (gpu_gray_batch - gpu_bg_batch).abs()
+
+                # 批次 thresholding (每個相機可各自調整靈敏度)
+                thresholds = [it[3] for it in sub_items]
+                thresh_tensor = torch.tensor(thresholds, device=gpu_device, dtype=torch.float32).view(n_sub, 1, 1, 1)
+                gpu_thresh = (gpu_diff > thresh_tensor).to(torch.float32)
+
+                # 批次形態學處理 (CLOSE + OPEN)
+                dilated = F.max_pool2d(gpu_thresh, kernel_size=5, stride=1, padding=morph_pad)
+                closed = 1.0 - F.max_pool2d(1.0 - dilated, kernel_size=5, stride=1, padding=morph_pad)
+                eroded = 1.0 - F.max_pool2d(1.0 - closed, kernel_size=5, stride=1, padding=morph_pad)
+                cleaned_t = F.max_pool2d(eroded, kernel_size=5, stride=1, padding=morph_pad)
+
+                # 批次計算覆蓋率
+                total_pixels = proc_h * proc_w
+                covered_pixels = cleaned_t.sum(dim=(2, 3)).squeeze(1)
+                if n_sub == 1:
+                    covered_pixels = covered_pixels.view(-1)
+                coverages = (covered_pixels / total_pixels * 100.0).cpu().numpy()
+
+                # 下載 mask 回 CPU (只有 1 個通道，節省傳輸頻寬)
+                cleaned_u8 = (cleaned_t.squeeze(1) * 255).to(torch.uint8).cpu().numpy()
+                if n_sub == 1:
+                    cleaned_u8 = cleaned_u8.reshape(1, proc_h, proc_w)
+
+            # 5. 在 CPU 端為各台相機生成 final display 圖像與輪廓 (極輕量)
+            for idx, (cam_id, frame_bgr, _, _, _) in enumerate(sub_items):
+                mask_cpu = cleaned_u8[idx]
+                cov = float(coverages[idx])
+
+                diff_display = np.zeros((proc_h, proc_w, 3), dtype=np.uint8)
+                diff_display[mask_cpu > 0] = (100, 255, 0)  # 綠色
+
+                contours, _ = cv2.findContours(mask_cpu, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(diff_display, contours, -1, (0, 255, 100), 2)
+                cv2.putText(diff_display, f"Coverage: {cov:.1f}%",
+                            (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 230, 255), 2)
+
+                self.frame_processed.emit(cam_id, frame_bgr, diff_display, cov)
+
+
+# ===============================================================
 # MainWindow：主視窗  V4.0.1
 # ===============================================================
 class MainWindow(QMainWindow):
@@ -1151,6 +1188,10 @@ class MainWindow(QMainWindow):
         self._setup_ui()
         self._apply_dark_theme()
         self.enum_devices()
+
+        # Initialize global GPUBatchProcessor
+        self.gpu_processor = GPUBatchProcessor()
+        self.gpu_processor.frame_processed.connect(self._on_frame_ready)
 
         self.monitor_thread = MonitorThread()
         self.monitor_thread.stats_ready.connect(self._on_monitor_stats)
@@ -1596,7 +1637,7 @@ class MainWindow(QMainWindow):
             return False
 
         use_cuda = self.cuda_radio.isChecked() and HAS_CUDA
-        t = CameraThread(cam, cam_id=idx, use_cuda=use_cuda)
+        t = CameraThread(cam, cam_id=idx, use_cuda=use_cuda, gpu_processor=self.gpu_processor)
         t.target_fps     = self.fps_spin.value()
         t.diff_threshold = self.thresh_slider.value()
         t.frame_ready.connect(self._on_frame_ready)
@@ -1623,10 +1664,27 @@ class MainWindow(QMainWindow):
         if 0 <= slot < len(self._cam_widgets):
             self._cam_widgets[slot].set_disconnected()
 
+        # If no more cameras are running, stop the GPU processor and re-enable UI mode selection
+        if not self._cameras:
+            if self.gpu_processor.isRunning():
+                self.gpu_processor.stop()
+            self.cpu_radio.setEnabled(True)
+            if HAS_CUDA:
+                self.cuda_radio.setEnabled(True)
+
     def start_all(self):
         if self.cuda_radio.isChecked() and not HAS_CUDA:
             QMessageBox.warning(self, tr("cuda_err"), tr("cuda_fallback"))
             self.cpu_radio.setChecked(True)
+
+        use_cuda = self.cuda_radio.isChecked() and HAS_CUDA
+        if use_cuda:
+            if not self.gpu_processor.isRunning():
+                self.gpu_processor.start()
+
+        # Lock UI mode selection while streaming is active
+        self.cpu_radio.setEnabled(False)
+        self.cuda_radio.setEnabled(False)
 
         n = min(self.device_list.nDeviceNum, MAX_CAMERAS)
         for i in range(n):
@@ -1636,6 +1694,16 @@ class MainWindow(QMainWindow):
     def stop_all(self):
         for idx in list(self._cameras.keys()):
             self._close_camera(idx)
+
+        # Ensure the GPU batch processor is stopped
+        if self.gpu_processor.isRunning():
+            self.gpu_processor.stop()
+
+        # Re-enable mode selection
+        self.cpu_radio.setEnabled(True)
+        if HAS_CUDA:
+            self.cuda_radio.setEnabled(True)
+
         # Force-clear ALL widget slots so no stale frame remains visible
         for cw in self._cam_widgets:
             cw.set_disconnected()
@@ -1677,13 +1745,18 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────
     def _on_reset_bg_requested(self, cam_id: int):
         """單台相機重設背景快照。"""
-        if cam_id in self._cameras:
+        if self.gpu_processor.isRunning():
+            self.gpu_processor.reset_background(cam_id)
+        elif cam_id in self._cameras:
             self._cameras[cam_id]["thread"].reset_background()
 
     def _reset_all_backgrounds(self):
         """全部相機重設背景快照。"""
-        for entry in self._cameras.values():
-            entry["thread"].reset_background()
+        if self.gpu_processor.isRunning():
+            self.gpu_processor.clear_all_backgrounds()
+        else:
+            for entry in self._cameras.values():
+                entry["thread"].reset_background()
 
     # ──────────────────────────────────────────────────────────
     # 全域 Alert 閾值
