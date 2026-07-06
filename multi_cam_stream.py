@@ -278,7 +278,51 @@ class CameraThread(QThread):
 
         self.running = True
         self.target_fps     = 15
-        self.diff_threshold = 5          # 預先配置 RGB 轉換記憶體（Payload * 3 = 足夠 BGR8）
+        self.diff_threshold = 5     # V4.0.1：預設值改為 5
+
+        self._subtraction_enabled = False
+        self._lock = threading.Lock()
+
+        # V4.0.1：bg_frame 凍結為靜態快照（uint8），不再持續 accumulateWeighted
+        self.bg_frame: Optional[np.ndarray] = None
+
+    # ─────────────────────────────────────────────────────
+    # 啟用 / 停用影像相減
+    #   停用時清除背景快照，下次啟用重新拍攝第一幀
+    # ─────────────────────────────────────────────────────
+    def set_subtraction(self, enabled: bool):
+        with self._lock:
+            self._subtraction_enabled = enabled
+        if not enabled:
+            self._reset_background()
+
+    def get_subtraction(self) -> bool:
+        with self._lock:
+            return self._subtraction_enabled
+
+    # ─────────────────────────────────────────────────────
+    # 重設背景快照（供外部呼叫，例如按下「重設背景」按鈕）
+    # ─────────────────────────────────────────────────────
+    def reset_background(self):
+        self._reset_background()
+
+    def _reset_background(self):
+        """清除背景，下一幀到來時自動重新凍結快照。"""
+        self.bg_frame = None
+
+    def run(self):
+        stFrameInfo   = MV_FRAME_OUT_INFO_EX()
+        stPayloadSize = MVCC_INTVALUE_EX()
+
+        ret = self.cam.MV_CC_GetIntValueEx("PayloadSize", stPayloadSize)
+        if ret != 0:
+            print(f"[Cam {self.cam_id}] 無法獲取 PayloadSize")
+            return
+
+        nPayloadSize = stPayloadSize.nCurValue
+        pData = (c_ubyte * nPayloadSize)()
+
+        # 預先配置 RGB 轉換記憶體（Payload * 3 = 足夠 BGR8）
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
 
