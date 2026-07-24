@@ -62,8 +62,9 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QComboBox, QSpinBox, QGroupBox,
     QMessageBox, QRadioButton, QButtonGroup, QScrollArea, QGridLayout,
-    QCheckBox, QSizePolicy, QFrame, QSplitter, QListWidget, QListWidgetItem,
-    QTabWidget, QDoubleSpinBox, QDialog, QStackedWidget
+    QFormLayout, QCheckBox, QSizePolicy, QFrame, QSplitter,
+    QListWidget, QListWidgetItem, QTabWidget, QDoubleSpinBox,
+    QDialog, QStackedWidget
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QCursor
@@ -87,6 +88,8 @@ import matplotlib.dates as mdates
 MAX_CAMERAS   = 20
 CAMS_PER_PAGE = 2    # 每頁 2 台，左右並排
 PAGE_COUNT    = MAX_CAMERAS // CAMS_PER_PAGE   # 10 頁
+OV_COLS       = 4    # Overview grid columns (4×5 = 20 cameras)
+OV_ROWS       = 5
 
 # ── Coverage 紀錄 ────────────────────────────────────────────
 LOG_DIR          = os.path.join(
@@ -167,6 +170,46 @@ def is_cuda_supported() -> bool:
 HAS_CUDA = is_cuda_supported()
 
 
+def _enable_cuda_blocking_sync():
+    """把 CUDA 同步模式改為 blocking sync，避免 busy-wait 空轉。
+
+    PyTorch 呼叫 .cpu() / .item() 等待 GPU 完成時，CUDA runtime 預設會讓
+    CPU 自旋等待（spin-wait），等待期間該執行緒的 CPU 使用率會直接吃滿。
+    多台相機同時串流時，GPU 模式的 CPU 使用量反而比 CPU 模式高就是這個原因。
+    這裡在 CUDA context 建立前先設定 cudaDeviceScheduleBlockingSync，
+    讓等待 GPU 時執行緒真正進入睡眠、釋放 CPU。
+    """
+    try:
+        import ctypes
+        if platform.system() == "Windows":
+            candidates = ["cudart64_12.dll", "cudart64_121.dll",
+                          "cudart64_120.dll", "cudart64_110.dll",
+                          "cudart64_102.dll", "cudart64_101.dll"]
+        else:
+            candidates = ["libcudart.so", "libcudart.so.12", "libcudart.so.11.0"]
+        libcudart = None
+        for name in candidates:
+            try:
+                libcudart = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if libcudart is None:
+            return
+        cudaDeviceScheduleBlockingSync = 0x04
+        libcudart.cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync)
+    except Exception:
+        pass
+
+
+if HAS_CUDA:
+    # 必須在任何 CUDA context 建立（第一次 tensor 上 GPU）之前呼叫
+    _enable_cuda_blocking_sync()
+    # GPU 模式下 torch 只負責發 kernel，不需要 intra-op 執行緒池
+    # （預設會依 CPU 核心數開執行緒，20 台相機時徒增排程負擔）
+    torch.set_num_threads(1)
+
+
 def _make_gaussian_kernel(ksize: int, device):
     """建立與 cv2.GaussianBlur(ksize, sigma=0) 等效的 2D 高斯核（torch）。"""
     sigma = 0.3 * ((ksize - 1) * 0.5 - 1) + 0.8     # OpenCV 預設 sigma 公式
@@ -174,18 +217,6 @@ def _make_gaussian_kernel(ksize: int, device):
     g1d = torch.exp(-(ax ** 2) / (2.0 * sigma * sigma))
     g1d = g1d / g1d.sum()
     return torch.outer(g1d, g1d).reshape(1, 1, ksize, ksize)
-
-
-def _make_morph_kernel(ksize: int, device):
-    """建立形態學橢圓核（模擬 cv2.getStructuringElement MORPH_ELLIPSE）。"""
-    r = ksize // 2
-    y, x = torch.meshgrid(
-        torch.arange(ksize, device=device) - r,
-        torch.arange(ksize, device=device) - r,
-        indexing='ij'
-    )
-    mask = ((x.float() / max(r, 1)) ** 2 + (y.float() / max(r, 1)) ** 2 <= 1.0)
-    return mask.float().reshape(1, 1, ksize, ksize)
 
 
 # ===============================================================
@@ -247,7 +278,51 @@ class CameraThread(QThread):
 
         self.running = True
         self.target_fps     = 15
-        self.diff_threshold = 5          # 預先配置 RGB 轉換記憶體（Payload * 3 = 足夠 BGR8）
+        self.diff_threshold = 5     # V4.0.1：預設值改為 5
+
+        self._subtraction_enabled = False
+        self._lock = threading.Lock()
+
+        # V4.0.1：bg_frame 凍結為靜態快照（uint8），不再持續 accumulateWeighted
+        self.bg_frame: Optional[np.ndarray] = None
+
+    # ─────────────────────────────────────────────────────
+    # 啟用 / 停用影像相減
+    #   停用時清除背景快照，下次啟用重新拍攝第一幀
+    # ─────────────────────────────────────────────────────
+    def set_subtraction(self, enabled: bool):
+        with self._lock:
+            self._subtraction_enabled = enabled
+        if not enabled:
+            self._reset_background()
+
+    def get_subtraction(self) -> bool:
+        with self._lock:
+            return self._subtraction_enabled
+
+    # ─────────────────────────────────────────────────────
+    # 重設背景快照（供外部呼叫，例如按下「重設背景」按鈕）
+    # ─────────────────────────────────────────────────────
+    def reset_background(self):
+        self._reset_background()
+
+    def _reset_background(self):
+        """清除背景，下一幀到來時自動重新凍結快照。"""
+        self.bg_frame = None
+
+    def run(self):
+        stFrameInfo   = MV_FRAME_OUT_INFO_EX()
+        stPayloadSize = MVCC_INTVALUE_EX()
+
+        ret = self.cam.MV_CC_GetIntValueEx("PayloadSize", stPayloadSize)
+        if ret != 0:
+            print(f"[Cam {self.cam_id}] 無法獲取 PayloadSize")
+            return
+
+        nPayloadSize = stPayloadSize.nCurValue
+        pData = (c_ubyte * nPayloadSize)()
+
+        # 預先配置 RGB 轉換記憶體（Payload * 3 = 足夠 BGR8）
         max_rgb_size = nPayloadSize * 3
         pDataForRGB  = (c_ubyte * max_rgb_size)()
 
@@ -569,6 +644,7 @@ class CameraWidget(QFrame):
         self._sub_enabled = False
         self._coverage_alert_threshold = 50.0
         self._alert_active = False
+        self._flash_state = False
         self._fullscreen_dlg = None   # type: Optional[FullscreenDialog]
         self._last_bgr = None         # type: Optional[np.ndarray]
         self._last_frame_time = 0.0
@@ -577,6 +653,10 @@ class CameraWidget(QFrame):
         self._minute_sum   = 0.0
         self._minute_count = 0
         self._chart_mode   = False    # False=即時畫面, True=折線圖
+        # Flashing red border timer (400 ms interval) for coverage alerts
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(400)
+        self._flash_timer.timeout.connect(self._on_flash_tick)
         self._setup_ui()
 
     # ─────────────────────────────────────────────────────
@@ -774,6 +854,8 @@ class CameraWidget(QFrame):
     #  樣式
     # ─────────────────────────────────────────────────────
     def _apply_normal_style(self):
+        self._flash_timer.stop()
+        self._flash_state = False
         self.setStyleSheet("""
             CameraWidget {
                 border: 1px solid #2e2e4a;
@@ -782,14 +864,24 @@ class CameraWidget(QFrame):
             }
         """)
 
-    def _apply_alert_style(self):
-        self.setStyleSheet("""
-            CameraWidget {
-                border: 2px solid #ff4444;
-                border-radius: 7px;
-                background: #1e0808;
-            }
-        """)
+    def _on_flash_tick(self):
+        self._flash_state = not self._flash_state
+        if self._flash_state:
+            self.setStyleSheet("""
+                CameraWidget {
+                    border: 3px solid #ff2222;
+                    border-radius: 7px;
+                    background: #1e0404;
+                }
+            """)
+        else:
+            self.setStyleSheet("""
+                CameraWidget {
+                    border: 3px solid #661111;
+                    border-radius: 7px;
+                    background: #160303;
+                }
+            """)
 
     # ─────────────────────────────────────────────────────
     #  槽位對應的相機 ID
@@ -974,7 +1066,8 @@ class CameraWidget(QFrame):
         if coverage >= self._coverage_alert_threshold:
             if not self._alert_active:
                 self._alert_active = True
-                self._apply_alert_style()
+                if not self._flash_timer.isActive():
+                    self._flash_timer.start()
             self.alert_lbl.setText(f"⚠ >{self._coverage_alert_threshold:.0f}%")
         else:
             if self._alert_active:
@@ -990,8 +1083,10 @@ class CameraWidget(QFrame):
 
     def set_disconnected(self):
         self._conn_state = "stopped"
+        self._alert_active = False
+        self._apply_normal_style()   # stops flash timer
         self._last_bgr = None
-        self.orig_lbl.setText(tr("stopped"))
+        self.orig_lbl.setText("OFF")
         self.orig_lbl.setPixmap(QPixmap())
         self.diff_lbl.setVisible(False)
         self.res_lbl.setText("----×----")
@@ -1002,8 +1097,6 @@ class CameraWidget(QFrame):
         self.status_lbl.setToolTip(tr("stopped"))
         self.cov_lbl.setText("--")
         self.alert_lbl.setText("")
-        self._alert_active = False
-        self._apply_normal_style()
 
     @staticmethod
     def _to_pixmap(cv_img: np.ndarray, w: int, h: int) -> QPixmap:
@@ -1012,6 +1105,192 @@ class CameraWidget(QFrame):
         qimg  = QImage(rgb.data, w_img, h_img, ch * w_img, QImage.Format_RGB888)
         return QPixmap.fromImage(qimg.copy()).scaled(
             w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+
+# ===============================================================
+# CompactCameraCard  — read-only overview slot for the 4×5 grid
+#
+#   ┌── #01  [label ─────────────]  23.4%  12f  ● ──────────┐
+#   │   live video (double-click → fullscreen)               │
+#   │   "OFF" text when disconnected                         │
+#   └───────────────────────────────────────────────────────┘
+#   Red border flashes at 400 ms when coverage ≥ threshold.
+# ===============================================================
+class CompactCameraCard(QFrame):
+
+    _STYLE_NORMAL = """
+        CompactCameraCard {
+            border: 1px solid #2e2e4a;
+            border-radius: 5px;
+            background: #12122a;
+        }
+    """
+    _STYLE_FLASH_ON = """
+        CompactCameraCard {
+            border: 3px solid #ff2222;
+            border-radius: 5px;
+            background: #1e0404;
+        }
+    """
+    _STYLE_FLASH_OFF = """
+        CompactCameraCard {
+            border: 3px solid #661111;
+            border-radius: 5px;
+            background: #160303;
+        }
+    """
+
+    def __init__(self, cam_id: int, label: str, parent=None):
+        super().__init__(parent)
+        self.cam_id = cam_id
+        self._coverage_alert_threshold = 50.0
+        self._alert_active = False
+        self._flash_state = False
+        self._last_bgr: Optional[np.ndarray] = None
+        self._last_frame_time = 0.0
+        self._fullscreen_dlg: Optional[FullscreenDialog] = None
+
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(400)
+        self._flash_timer.timeout.connect(self._on_flash_tick)
+
+        self._build_ui(label)
+        self.setStyleSheet(self._STYLE_NORMAL)
+
+    def _build_ui(self, label: str):
+        self.setFrameShape(QFrame.Box)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(3, 2, 3, 2)
+        root.setSpacing(2)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(3)
+        bar.setContentsMargins(0, 0, 0, 0)
+
+        id_lbl = QLabel(f"#{self.cam_id + 1:02d}")
+        id_lbl.setFixedWidth(24)
+        id_lbl.setStyleSheet(
+            "color:#7799dd; font-weight:bold; font-size:11px;")
+        bar.addWidget(id_lbl)
+
+        self.name_lbl = QLabel(label)
+        self.name_lbl.setStyleSheet("color:#8899bb; font-size:10px;")
+        bar.addWidget(self.name_lbl, 1)
+
+        self.cov_lbl = QLabel("--")
+        self.cov_lbl.setFixedWidth(42)
+        self.cov_lbl.setStyleSheet(
+            "color:#55ccee; font-size:10px; font-weight:bold;"
+            " qproperty-alignment:AlignRight;")
+        bar.addWidget(self.cov_lbl)
+
+        self.fps_lbl = QLabel("--")
+        self.fps_lbl.setFixedWidth(26)
+        self.fps_lbl.setStyleSheet(
+            "color:#888; font-size:10px; qproperty-alignment:AlignRight;")
+        bar.addWidget(self.fps_lbl)
+
+        self.dot = QLabel("●")
+        self.dot.setFixedWidth(14)
+        self.dot.setStyleSheet("color:#cc3333; font-size:11px;")
+        bar.addWidget(self.dot)
+
+        root.addLayout(bar)
+
+        self.img_container = QWidget()
+        self.img_container.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.img_container.setStyleSheet(
+            "background:#060610; border-radius:3px;")
+
+        self.video_lbl = QLabel(self.img_container)
+        self.video_lbl.setAlignment(Qt.AlignCenter)
+        self.video_lbl.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.video_lbl.setStyleSheet(
+            "background:transparent; color:#444466;"
+            " font-size:16px; font-weight:bold; letter-spacing:2px;")
+        self.video_lbl.setText("OFF")
+
+        root.addWidget(self.img_container, 1)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.video_lbl.setGeometry(
+            0, 0,
+            self.img_container.width(),
+            self.img_container.height())
+
+    def mouseDoubleClickEvent(self, event):
+        if self._fullscreen_dlg is None or not self._fullscreen_dlg.isVisible():
+            self._fullscreen_dlg = FullscreenDialog(
+                self.name_lbl.text(), self)
+            if self._last_bgr is not None:
+                self._fullscreen_dlg.update_frame(self._last_bgr)
+            self._fullscreen_dlg.show()
+        super().mouseDoubleClickEvent(event)
+
+    def set_alert_threshold(self, val: float):
+        self._coverage_alert_threshold = val
+
+    def _on_flash_tick(self):
+        self._flash_state = not self._flash_state
+        self.setStyleSheet(
+            self._STYLE_FLASH_ON if self._flash_state
+            else self._STYLE_FLASH_OFF)
+
+    def _clear_alert(self):
+        self._flash_timer.stop()
+        self._flash_state = False
+        self.setStyleSheet(self._STYLE_NORMAL)
+
+    def update_frames(self, bgr: np.ndarray, coverage: float):
+        t = time.time()
+        if self._last_frame_time > 0:
+            fps = 1.0 / max(t - self._last_frame_time, 0.001)
+            self.fps_lbl.setText(f"{fps:.0f}f")
+        self._last_frame_time = t
+        self._last_bgr = bgr
+
+        w = self.video_lbl.width()
+        h = self.video_lbl.height()
+        if w > 0 and h > 0:
+            h_i, w_i, ch = bgr.shape
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            qimg = QImage(rgb.data, w_i, h_i, ch * w_i, QImage.Format_RGB888)
+            self.video_lbl.setPixmap(
+                QPixmap.fromImage(qimg.copy()).scaled(
+                    w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        if self._fullscreen_dlg and self._fullscreen_dlg.isVisible():
+            self._fullscreen_dlg.update_frame(bgr)
+
+        self.cov_lbl.setText(f"{coverage:.1f}%")
+
+        if coverage >= self._coverage_alert_threshold:
+            if not self._alert_active:
+                self._alert_active = True
+                if not self._flash_timer.isActive():
+                    self._flash_timer.start()
+        else:
+            if self._alert_active:
+                self._alert_active = False
+                self._clear_alert()
+
+        self.dot.setText("●")
+        self.dot.setStyleSheet("color:#2ecc71; font-size:11px;")
+
+    def set_disconnected(self):
+        self._alert_active = False
+        self._clear_alert()
+        self._last_bgr = None
+        self.video_lbl.setText("OFF")
+        self.video_lbl.setPixmap(QPixmap())
+        self.fps_lbl.setText("--")
+        self._last_frame_time = 0.0
+        self.dot.setText("●")
+        self.dot.setStyleSheet("color:#cc3333; font-size:11px;")
+        self.cov_lbl.setText("--")
 
 
 # ===============================================================
@@ -1231,7 +1510,6 @@ class MainWindow(QMainWindow):
         # 左側控制欄（固定寬 320px）
         # ─────────────────────────────────────────────────────
         left_widget = QWidget()
-        left_widget.setFixedWidth(320)
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(10)
@@ -1316,6 +1594,115 @@ class MainWindow(QMainWindow):
         self.fps_spin.valueChanged.connect(self._apply_fps)
         param_layout.addWidget(self.fps_spin)
 
+        # ── ⚙️ Camera Parameters sub-card ───────────────────────
+        # Object-name scoped selector prevents the background rule from
+        # leaking into child QFrame internals (e.g. spinbox up/down frames).
+        cam_param_card = QFrame()
+        cam_param_card.setObjectName("camParamCard")
+        cam_param_card.setStyleSheet(
+            "QFrame#camParamCard {"
+            " background:#181830; border:1px solid #2a2a48;"
+            " border-radius:5px;"
+            "}")
+        cp = QVBoxLayout(cam_param_card)
+        cp.setContentsMargins(9, 10, 9, 10)
+        cp.setSpacing(8)
+
+        cp_title = QLabel("⚙️ Camera Parameters")
+        cp_title.setStyleSheet(
+            "color:#7799cc; font-size:12px; font-weight:bold;"
+            " background:transparent; border:none;")
+        cp.addWidget(cp_title)
+
+        _field_ss = (
+            "QDoubleSpinBox {"
+            " background:#1a1a30; border:1px solid #3a3a5a;"
+            " border-radius:4px; padding:3px 6px;"
+            " font-size:13px; color:#e8eeff;"
+            "}"
+            " QDoubleSpinBox:focus { border-color:#5577cc; }"
+        )
+        _lbl_ss = (
+            "color:#8899bb; font-size:12px;"
+            " background:transparent; border:none;"
+        )
+
+        # QFormLayout gives reliable two-column label/field alignment
+        # without needing manual column-width arithmetic.
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setFormAlignment(Qt.AlignLeft | Qt.AlignTop)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(7)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        lbl_exp = QLabel("Exposure (µs):")
+        lbl_exp.setStyleSheet(_lbl_ss)
+        self.cam_exp_spin = QDoubleSpinBox()
+        self.cam_exp_spin.setRange(100.0, 1_000_000.0)
+        self.cam_exp_spin.setValue(50000.0)
+        self.cam_exp_spin.setDecimals(2)
+        self.cam_exp_spin.setSingleStep(1000.0)
+        self.cam_exp_spin.setMinimumHeight(28)
+        self.cam_exp_spin.setStyleSheet(_field_ss)
+
+        lbl_gain = QLabel("Gain (dB):")
+        lbl_gain.setStyleSheet(_lbl_ss)
+        self.cam_gain_spin = QDoubleSpinBox()
+        self.cam_gain_spin.setRange(0.0, 48.0)
+        self.cam_gain_spin.setValue(0.0)
+        self.cam_gain_spin.setDecimals(2)
+        self.cam_gain_spin.setSingleStep(0.5)
+        self.cam_gain_spin.setMinimumHeight(28)
+        self.cam_gain_spin.setStyleSheet(_field_ss)
+
+        lbl_fr = QLabel("Frame Rate:")
+        lbl_fr.setStyleSheet(_lbl_ss)
+        self.cam_fr_spin = QDoubleSpinBox()
+        self.cam_fr_spin.setRange(1.0, 60.0)
+        self.cam_fr_spin.setValue(20.0)
+        self.cam_fr_spin.setDecimals(2)
+        self.cam_fr_spin.setSingleStep(1.0)
+        self.cam_fr_spin.setMinimumHeight(28)
+        self.cam_fr_spin.setStyleSheet(_field_ss)
+
+        form.addRow(lbl_exp,  self.cam_exp_spin)
+        form.addRow(lbl_gain, self.cam_gain_spin)
+        form.addRow(lbl_fr,   self.cam_fr_spin)
+        cp.addLayout(form)
+
+        _pbtn_ss = (
+            "QPushButton {"
+            " background:#1c2235; color:#aabbdd;"
+            " border:1px solid #3a4a6a; border-radius:5px;"
+            " font-size:12px; padding:5px 0;"
+            "}"
+            " QPushButton:hover  { background:#232d44; border-color:#5577aa; color:#cce0ff; }"
+            " QPushButton:pressed { background:#111828; }"
+        )
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self.get_param_btn = QPushButton("📥 Get Param")
+        self.get_param_btn.setMinimumHeight(30)
+        self.get_param_btn.setStyleSheet(_pbtn_ss)
+        self.get_param_btn.clicked.connect(self._get_cam_params)
+        self.set_param_btn = QPushButton("📤 Set Param")
+        self.set_param_btn.setMinimumHeight(30)
+        self.set_param_btn.setStyleSheet(_pbtn_ss)
+        self.set_param_btn.clicked.connect(self._set_cam_params)
+        btn_row.addWidget(self.get_param_btn)
+        btn_row.addWidget(self.set_param_btn)
+        cp.addLayout(btn_row)
+
+        self.cam_param_status = QLabel("Ready")
+        self.cam_param_status.setAlignment(Qt.AlignCenter)
+        self.cam_param_status.setStyleSheet(
+            "color:#556688; font-size:11px;"
+            " background:transparent; border:none;")
+        cp.addWidget(self.cam_param_status)
+
+        param_layout.addWidget(cam_param_card)
+
         # V4.0.1：靈敏度範圍 1~100，預設 5
         self.thresh_hdr_lbl = QLabel(tr("threshold"))
         self.thresh_hdr_lbl.setStyleSheet("font-size:13px;")
@@ -1383,7 +1770,18 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.dev_group)
 
         left_layout.addStretch()
-        splitter.addWidget(left_widget)
+
+        # Wrap in a scroll area — removes minimum-height constraint that
+        # was forcing the main window into an impossible geometry on launch.
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_widget)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFixedWidth(320)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        left_scroll.setStyleSheet(
+            "QScrollArea { border:none; background:#0e0e1e; }")
+        splitter.addWidget(left_scroll)
 
         # ─────────────────────────────────────────────────────
         # 右側：分頁式相機顯示（10 頁 × 2 台/頁，左右並排）
@@ -1441,9 +1839,77 @@ class MainWindow(QMainWindow):
             self.tab_widget.addTab(
                 page_widget, f"📷 P{page+1}  #{first:02d}-{last:02d}")
 
+        # "Overview" toggle button placed in the tab-bar's top-right corner
+        self.overview_btn = QPushButton("📊 Overview")
+        self.overview_btn.setCheckable(True)
+        self.overview_btn.setFixedHeight(26)
+        self.overview_btn.setStyleSheet("""
+            QPushButton {
+                background: #1c2a3a; color: #88aacc;
+                border: 1px solid #2a3a5a; border-radius: 5px;
+                font-size: 12px; padding: 0 10px; margin: 2px;
+            }
+            QPushButton:hover  { background: #243040; color: #aaccff; }
+            QPushButton:checked {
+                background: #1a3a5a; color: #55aaff;
+                border-color: #4488cc; font-weight: bold;
+            }
+        """)
+        self.overview_btn.clicked.connect(self._toggle_overview)
+        self.tab_widget.setCornerWidget(self.overview_btn, Qt.TopRightCorner)
+
         right_layout.addWidget(self.tab_widget)
+
+        # ── 4×5 overview grid (hidden until "Overview" is toggled) ───
+        self.overview_container = QWidget()
+        self.overview_container.setVisible(False)
+        self.overview_container.setStyleSheet("background: #0c0c1c;")
+        ov_root = QVBoxLayout(self.overview_container)
+        ov_root.setContentsMargins(6, 6, 6, 6)
+        ov_root.setSpacing(4)
+
+        ov_header = QHBoxLayout()
+        ov_title = QLabel("📊  Live Stream Matrix Dashboard")
+        ov_title.setStyleSheet(
+            "color:#aaccff; font-size:14px; font-weight:bold;")
+        ov_header.addWidget(ov_title)
+        ov_header.addStretch()
+        back_btn = QPushButton("← Back to Tabs")
+        back_btn.setFixedHeight(26)
+        back_btn.setStyleSheet("""
+            QPushButton {
+                background: #2a1a3a; color: #cc88ff;
+                border: 1px solid #5a2a7a; border-radius: 5px;
+                font-size: 12px; padding: 0 10px;
+            }
+            QPushButton:hover { background: #3a2050; color: #ddaaff; }
+        """)
+        back_btn.clicked.connect(lambda: self.overview_btn.click())
+        ov_header.addWidget(back_btn)
+        ov_root.addLayout(ov_header)
+
+        self._compact_cards: list = []
+        ov_grid = QGridLayout()
+        ov_grid.setSpacing(4)
+        for idx in range(MAX_CAMERAS):
+            label = (self._cam_labels[idx]
+                     if idx < len(self._cam_labels) else f"Cam {idx+1:02d}")
+            card = CompactCameraCard(idx, label)
+            self._compact_cards.append(card)
+            ov_grid.addWidget(card, idx // OV_COLS, idx % OV_COLS)
+
+        ov_root.addLayout(ov_grid, 1)
+        right_layout.addWidget(self.overview_container)
+
         splitter.addWidget(right_container)
         splitter.setSizes([320, 1600])
+
+    # ──────────────────────────────────────────────────────────
+    # Overview toggle
+    # ──────────────────────────────────────────────────────────
+    def _toggle_overview(self, checked: bool):
+        self.tab_widget.setVisible(not checked)
+        self.overview_container.setVisible(checked)
 
     # ──────────────────────────────────────────────────────────
     # 語言切換（🌐 一鍵中／英）
@@ -1663,6 +2129,8 @@ class MainWindow(QMainWindow):
         slot = self._get_slot_for_cam(idx)
         if 0 <= slot < len(self._cam_widgets):
             self._cam_widgets[slot].set_disconnected()
+        if 0 <= idx < len(self._compact_cards):
+            self._compact_cards[idx].set_disconnected()
 
         # If no more cameras are running, stop the GPU processor and re-enable UI mode selection
         if not self._cameras:
@@ -1695,18 +2163,23 @@ class MainWindow(QMainWindow):
         for idx in list(self._cameras.keys()):
             self._close_camera(idx)
 
-        # Ensure the GPU batch processor is stopped
         if self.gpu_processor.isRunning():
             self.gpu_processor.stop()
 
-        # Re-enable mode selection
         self.cpu_radio.setEnabled(True)
         if HAS_CUDA:
             self.cuda_radio.setEnabled(True)
 
-        # Force-clear ALL widget slots so no stale frame remains visible
         for cw in self._cam_widgets:
             cw.set_disconnected()
+            cw.sub_btn.setChecked(False)
+            cw.sub_btn.setText("OFF")
+            cw._sub_enabled = False
+            cw.diff_lbl.setVisible(False)
+        for card in self._compact_cards:
+            card.set_disconnected()
+        self.sub_all_btn.setChecked(False)
+        self.sub_all_btn.setText(tr("sub_all_off"))
         self.cam_cnt_lbl.setText(tr("streaming_n", n=0))
 
     # ──────────────────────────────────────────────────────────
@@ -1714,13 +2187,13 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────────────────────────────────
     def _on_frame_ready(self, cam_id: int, bgr: np.ndarray,
                         diff: np.ndarray, coverage: float):
-        # Guard: ignore frames that arrive after the camera has been closed.
-        # Qt queues signals, so a few frames can arrive even after stop().
         if cam_id not in self._cameras:
             return
         slot = self._get_slot_for_cam(cam_id)
         if 0 <= slot < len(self._cam_widgets):
             self._cam_widgets[slot].update_frames(bgr, diff, coverage)
+        if 0 <= cam_id < len(self._compact_cards):
+            self._compact_cards[cam_id].update_frames(bgr, coverage)
 
     # ──────────────────────────────────────────────────────────
     # 相減控制
@@ -1764,6 +2237,8 @@ class MainWindow(QMainWindow):
     def _apply_global_alert(self, val: float):
         for cw in self._cam_widgets:
             cw.set_alert_threshold(val)
+        for card in self._compact_cards:
+            card.set_alert_threshold(val)
 
     # ──────────────────────────────────────────────────────────
     # 全域參數同步
@@ -1771,6 +2246,57 @@ class MainWindow(QMainWindow):
     def _apply_fps(self, val: int):
         for entry in self._cameras.values():
             entry["thread"].target_fps = val
+
+    # ──────────────────────────────────────────────────────────
+    # Camera Parameters — Get / Set (all connected cameras)
+    # ──────────────────────────────────────────────────────────
+    def _get_cam_params(self):
+        if not self._cameras:
+            self._cp_status("⚠ No camera connected", "#cc8833")
+            return
+        cam = next(iter(self._cameras.values()))["cam"]
+        try:
+            stParam = MVCC_FLOATVALUE()
+            if cam.MV_CC_GetFloatValue("ExposureTime", stParam) == 0:
+                self.cam_exp_spin.setValue(stParam.fCurValue)
+            if cam.MV_CC_GetFloatValue("Gain", stParam) == 0:
+                self.cam_gain_spin.setValue(stParam.fCurValue)
+            if cam.MV_CC_GetFloatValue("AcquisitionFrameRate", stParam) == 0:
+                self.cam_fr_spin.setValue(stParam.fCurValue)
+            self._cp_status("✓ Read OK", "#2ecc71")
+        except Exception:
+            self._cp_status("✗ Read error", "#cc3333")
+
+    def _set_cam_params(self):
+        if not self._cameras:
+            self._cp_status("⚠ No camera connected", "#cc8833")
+            return
+        exp  = self.cam_exp_spin.value()
+        gain = self.cam_gain_spin.value()
+        fps  = self.cam_fr_spin.value()
+        errors = []
+        for cam_id, entry in self._cameras.items():
+            cam = entry["cam"]
+            try:
+                cam.MV_CC_SetEnumValue("ExposureAuto", 0)
+                if cam.MV_CC_SetFloatValue("ExposureTime", exp) != 0:
+                    errors.append(f"#{cam_id} exp")
+                if cam.MV_CC_SetFloatValue("Gain", gain) != 0:
+                    errors.append(f"#{cam_id} gain")
+                cam.MV_CC_SetBoolValue("AcquisitionFrameRateEnable", True)
+                if cam.MV_CC_SetFloatValue("AcquisitionFrameRate", fps) != 0:
+                    errors.append(f"#{cam_id} fps")
+            except Exception:
+                errors.append(f"#{cam_id}")
+        if errors:
+            self._cp_status(f"✗ {', '.join(errors)}", "#cc3333")
+        else:
+            self._cp_status(f"✓ Applied → {len(self._cameras)} cam(s)", "#2ecc71")
+
+    def _cp_status(self, msg: str, colour: str):
+        self.cam_param_status.setText(msg)
+        self.cam_param_status.setStyleSheet(
+            f"color:{colour}; font-size:11px;")
 
     def _apply_threshold(self, val: int):
         for entry in self._cameras.values():
