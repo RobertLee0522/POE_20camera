@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poe-multi-aravis"
+version = "1.0.0"
+description = "20-camera PoE/GigE Vision monitoring application built on Aravis"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "POE Multi-Camera Team" }]
+keywords = ["aravis", "genicam", "gige-vision", "poe", "machine-vision", "pyqt5"]
+
+# NOTE: PyGObject + the Aravis GI typelib are SYSTEM dependencies and are not
+# installed via pip.  See README.md for platform setup.
+dependencies = [
+    "PyQt5>=5.15",
+    "numpy>=1.20",
+    "opencv-python>=4.5",
+    "psutil>=5.8",
+    "matplotlib>=3.4",
+    "PyYAML>=5.4",
+]
+
+[project.optional-dependencies]
+gpu = ["torch>=1.12"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.scripts]
+poe-multi-aravis = "poe_multi_aravis.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
