@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────
+# POE 20-camera Aravis monitor — default configuration
+# Every key here is optional; missing keys fall back to the
+# built-in defaults in src/poe_multi_aravis/settings.py.
+# ─────────────────────────────────────────────────────────────
+
+camera:
+  max_cameras: 20
+  # Per-camera Aravis buffer pool.  Keep this small: 20 cameras × 24 buffers
+  # × a multi-megapixel payload reserves several GB before the first frame.
+  buffer_count: 8
+  frame_timeout_ms: 500
+  auto_start_all: false
+  reconnect_enabled: true
+  reconnect_interval_seconds: 3
+  max_reconnect_attempts: 10
+  consecutive_failure_threshold: 5
+  packet_delay_ns: 0
+
+processing:
+  mode: cpu                   # "cpu" or "cuda"
+  target_fps: 15              # per-camera processing rate cap
+  analysis_width: 640
+  analysis_height: 480
+  difference_threshold: 5
+  gaussian_kernel: 21         # must be odd
+  morphology_kernel: 5
+  alert_threshold_percent: 50.0
+  gpu_max_batch: 20           # cameras coalesced into one CUDA batch
+  # RGB/HSL/brightness statistics per frame.  Off by default: at 20 cameras
+  # the extra colour-space conversions cost more than they inform.
+  enable_image_analysis: false
+
+logging:
+  enabled: true
+  interval_seconds: 60        # one averaged row per camera per interval
+  directory: "./data/coverage"
+
+monitoring:
+  interval_seconds: 1.5
+
+ui:
+  language: "zh"              # "zh" or "en"
+  cameras_per_page: 2         # 20 cameras / 2 = 10 tabs
+  overview_columns: 4         # 4 × 5 overview matrix
+  show_difference_pip: true
+  # Cap the width of frames handed to the UI thread.  Downscale-only: smaller
+  # frames pass through untouched.  Set 0 to send full acquisition resolution.
+  display_max_width: 960

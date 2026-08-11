@@ -1,0 +1,11 @@
+# The repository root ignores *.md and test_*.py.  This application ships
+# both as source, so re-include them for everything under this folder.
+!*.md
+!test_*.py
+
+# Runtime output
+__pycache__/
+*.pyc
+data/
+snapshots/
+*.log
