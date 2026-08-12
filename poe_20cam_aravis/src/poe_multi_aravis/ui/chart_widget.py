@@ -28,6 +28,7 @@ import matplotlib.dates as mdates
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox
 
 from .i18n import tr
+from .scaling import sf, sx
 from .theme import C
 
 MAX_DAYS = 5
@@ -43,18 +44,18 @@ class ChartWidget(QWidget):
         self._logger = None          # CoverageLogger
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(4, 4, 4, 4)
-        root.setSpacing(4)
+        root.setContentsMargins(sx(4), sx(4), sx(4), sx(4))
+        root.setSpacing(sx(4))
 
         bar = QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
         self._days_lbl = QLabel(tr("chart_days"))
         self._days_lbl.setStyleSheet(
-            f"color:{C.TEXT_DIM}; font-size:12px; background:transparent;")
+            f"color:{C.TEXT_DIM}; font-size:{sf(12)}px; background:transparent;")
         bar.addWidget(self._days_lbl)
 
         self._days_combo = QComboBox()
-        self._days_combo.setFixedWidth(90)
+        self._days_combo.setFixedWidth(sx(90))
         for d in range(1, MAX_DAYS + 1):
             self._days_combo.addItem(tr("day_n", d=d), d)
         self._days_combo.setCurrentIndex(DEFAULT_DAYS - 1)

@@ -165,16 +165,56 @@ def main(argv=None) -> int:
     _pin_qt_plugin_path()
 
     # Import Qt / Settings AFTER the Aravis bootstrap.
+    from PyQt5.QtCore import Qt, QTimer
     from PyQt5.QtWidgets import QApplication
     from .settings import Settings
     from .ui.main_window import MainWindow
+    from .ui.splash import AppSplash
+    from .ui import scaling
 
-    settings = Settings(args.config)
+    # Must be set before the QApplication instance exists.
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("POE Multi-Camera Monitor (Aravis)")
 
+    # Measure the screen the app is opening on and derive the UI scale
+    # factor *before* building any widget — every fixed pixel size in the
+    # UI reads it at construction time. See ui/scaling.py.
+    ui_scale = scaling.init_scale(app)
+    logging.getLogger(__name__).info(
+        "Screen %sx%s -> UI scale %.2f",
+        *scaling.screen_size(), ui_scale)
+
+    # Splash screen: everything below this point (settings validation, main
+    # window construction, first device discovery) has no window of its own
+    # yet, so give the user visible progress instead of a silent pause.
+    splash = AppSplash()
+    splash.show()
+    splash.step("正在載入設定 / Loading settings…")
+
+    settings = Settings(args.config)
+
+    splash.step("正在建立主視窗 / Building main window…")
     window = MainWindow(settings)
+
+    splash.step("正在偵測相機 / Discovering cameras…")
+
+    _dismissed = {"done": False}
+
+    def _dismiss_splash(*_args) -> None:
+        if _dismissed["done"]:
+            return
+        _dismissed["done"] = True
+        splash.finish(window)
+
+    # Closes once the first (auto-triggered) device refresh reports back;
+    # a timeout guards against discovery hanging (e.g. a slow/unresponsive
+    # GigE link) so the app never gets stuck behind the splash.
+    window.service.devices_updated.connect(_dismiss_splash)
+    QTimer.singleShot(6000, _dismiss_splash)
+
     window.showMaximized()
     return app.exec_()
 

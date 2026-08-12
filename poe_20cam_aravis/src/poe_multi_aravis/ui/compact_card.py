@@ -28,6 +28,7 @@ from PyQt5.QtWidgets import (
 from .camera_tile import to_pixmap
 from .fullscreen_dialog import FullscreenDialog
 from .i18n import tr
+from .scaling import sf, sx
 from .theme import C
 
 
@@ -80,42 +81,42 @@ class CompactCameraCard(QFrame):
     def _build_ui(self, label: str) -> None:
         self.setFrameShape(QFrame.Box)
         root = QVBoxLayout(self)
-        root.setContentsMargins(5, 4, 5, 5)
-        root.setSpacing(3)
+        root.setContentsMargins(sx(5), sx(4), sx(5), sx(5))
+        root.setSpacing(sx(3))
 
         bar = QHBoxLayout()
-        bar.setSpacing(4)
+        bar.setSpacing(sx(4))
         bar.setContentsMargins(0, 0, 0, 0)
 
         id_lbl = QLabel(f"#{self.index + 1:02d}")
-        id_lbl.setFixedWidth(26)
+        id_lbl.setFixedWidth(sx(26))
         id_lbl.setStyleSheet(
-            f"color:{C.ACCENT}; font-weight:700; font-size:11px; background:transparent;")
+            f"color:{C.ACCENT}; font-weight:700; font-size:{sf(11)}px; background:transparent;")
         bar.addWidget(id_lbl)
 
         self.name_lbl = QLabel(label)
         self.name_lbl.setStyleSheet(
-            f"color:{C.TEXT_DIM}; font-size:10px; background:transparent;")
+            f"color:{C.TEXT_DIM}; font-size:{sf(10)}px; background:transparent;")
         bar.addWidget(self.name_lbl, 1)
 
         self.cov_lbl = QLabel("--")
-        self.cov_lbl.setFixedWidth(44)
+        self.cov_lbl.setFixedWidth(sx(44))
         self.cov_lbl.setStyleSheet(
-            f"color:{C.ACCENT_2}; font-size:10px; font-weight:700;"
+            f"color:{C.ACCENT_2}; font-size:{sf(10)}px; font-weight:700;"
             " background:transparent; qproperty-alignment:AlignRight;")
         bar.addWidget(self.cov_lbl)
 
         self.fps_lbl = QLabel("--")
-        self.fps_lbl.setFixedWidth(30)
+        self.fps_lbl.setFixedWidth(sx(30))
         self.fps_lbl.setStyleSheet(
-            f"color:{C.TEXT_FAINT}; font-size:10px;"
+            f"color:{C.TEXT_FAINT}; font-size:{sf(10)}px;"
             " background:transparent; qproperty-alignment:AlignRight;")
         bar.addWidget(self.fps_lbl)
 
         self.dot = QLabel("●")
-        self.dot.setFixedWidth(14)
+        self.dot.setFixedWidth(sx(14))
         self.dot.setStyleSheet(
-            f"color:{C.DANGER}; font-size:11px; background:transparent;")
+            f"color:{C.DANGER}; font-size:{sf(11)}px; background:transparent;")
         bar.addWidget(self.dot)
 
         root.addLayout(bar)
@@ -129,7 +130,7 @@ class CompactCameraCard(QFrame):
         self.video_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_lbl.setStyleSheet(
             f"background:transparent; color:{C.TEXT_FAINT};"
-            " font-size:15px; font-weight:700; letter-spacing:2px;")
+            f" font-size:{sf(15)}px; font-weight:700; letter-spacing:2px;")
         self.video_lbl.setText("OFF")
 
         root.addWidget(self.img_container, 1)
@@ -174,7 +175,7 @@ class CompactCameraCard(QFrame):
             self.cov_lbl.setText("--")
 
         self.dot.setStyleSheet(
-            f"color:{C.SUCCESS}; font-size:11px; background:transparent;")
+            f"color:{C.SUCCESS}; font-size:{sf(11)}px; background:transparent;")
 
     def set_disconnected(self) -> None:
         self._clear_alert()
@@ -185,7 +186,7 @@ class CompactCameraCard(QFrame):
         self.fps_lbl.setText("--")
         self.cov_lbl.setText("--")
         self.dot.setStyleSheet(
-            f"color:{C.DANGER}; font-size:11px; background:transparent;")
+            f"color:{C.DANGER}; font-size:{sf(11)}px; background:transparent;")
 
     # ── internals ─────────────────────────────────────────────
 

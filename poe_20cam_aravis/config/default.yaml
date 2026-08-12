@@ -10,7 +10,7 @@ camera:
   # × a multi-megapixel payload reserves several GB before the first frame.
   buffer_count: 8
   frame_timeout_ms: 500
-  auto_start_all: false
+  auto_start_all: true
   reconnect_enabled: true
   reconnect_interval_seconds: 3
   max_reconnect_attempts: 10

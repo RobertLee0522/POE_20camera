@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=POE 20-Camera Monitor
+Name[zh_TW]=POE 20路相機監控 (Aravis)
+Comment=Aravis-based 20-camera PoE/GigE Vision dashboard
+Comment[zh_TW]=基於 Aravis 的 20 路 PoE/GigE Vision 相機監控儀表板
+Exec=/home/vedan/桌面/POE_20camera/poe_20cam_aravis/scripts/launch_desktop.sh
+Icon=camera-video
+Terminal=false
+Categories=Utility;Graphics;Photography;
+StartupWMClass=poe_multi_aravis
+StartupNotify=true

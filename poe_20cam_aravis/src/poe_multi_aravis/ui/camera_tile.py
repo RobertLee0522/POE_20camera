@@ -33,6 +33,7 @@ from ..domain.models import CameraDescriptor
 from .chart_widget import ChartWidget
 from .fullscreen_dialog import FullscreenDialog
 from .i18n import tr
+from .scaling import sf, sx
 from .theme import C, btn_ghost, btn_toggle
 
 _STYLE_NORMAL = f"""
@@ -97,76 +98,76 @@ class CameraTile(QFrame):
         self.setStyleSheet(_STYLE_NORMAL)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 6, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(sx(8), sx(6), sx(8), sx(8))
+        root.setSpacing(sx(6))
 
         bar = QHBoxLayout()
-        bar.setSpacing(5)
+        bar.setSpacing(sx(5))
         bar.setContentsMargins(0, 0, 0, 0)
 
         slot_lbl = QLabel(f"#{self.slot_id + 1:02d}")
-        slot_lbl.setFixedWidth(32)
+        slot_lbl.setFixedWidth(sx(32))
         slot_lbl.setStyleSheet(
-            f"color:{C.ACCENT}; font-weight:700; font-size:14px; background:transparent;")
+            f"color:{C.ACCENT}; font-weight:700; font-size:{sf(14)}px; background:transparent;")
         bar.addWidget(slot_lbl)
 
         self.cam_combo = QComboBox()
-        self.cam_combo.setMinimumHeight(30)
-        self.cam_combo.setMinimumWidth(120)
+        self.cam_combo.setMinimumHeight(sx(30))
+        self.cam_combo.setMinimumWidth(sx(120))
         self.cam_combo.currentIndexChanged.connect(self._on_combo_changed)
         bar.addWidget(self.cam_combo, 1)
 
         self.res_lbl = QLabel("----×----")
-        self.res_lbl.setFixedWidth(72)
+        self.res_lbl.setFixedWidth(sx(72))
         self.res_lbl.setStyleSheet(
-            f"color:{C.TEXT_FAINT}; font-size:12px; background:transparent;"
+            f"color:{C.TEXT_FAINT}; font-size:{sf(12)}px; background:transparent;"
             " qproperty-alignment:AlignRight;")
         bar.addWidget(self.res_lbl)
 
         self.fps_lbl = QLabel("--")
-        self.fps_lbl.setFixedWidth(58)
+        self.fps_lbl.setFixedWidth(sx(58))
         self.fps_lbl.setStyleSheet(
-            f"color:{C.WARNING}; font-size:12px; font-weight:600;"
+            f"color:{C.WARNING}; font-size:{sf(12)}px; font-weight:600;"
             " background:transparent; qproperty-alignment:AlignRight;")
         bar.addWidget(self.fps_lbl)
 
         cov_icon = QLabel("▣")
-        cov_icon.setStyleSheet(f"color:{C.ACCENT}; font-size:14px; background:transparent;")
+        cov_icon.setStyleSheet(f"color:{C.ACCENT}; font-size:{sf(14)}px; background:transparent;")
         bar.addWidget(cov_icon)
         self.cov_lbl = QLabel("--")
-        self.cov_lbl.setFixedWidth(54)
+        self.cov_lbl.setFixedWidth(sx(54))
         self.cov_lbl.setStyleSheet(
-            f"color:{C.ACCENT_2}; font-size:13px; font-weight:700; background:transparent;")
+            f"color:{C.ACCENT_2}; font-size:{sf(13)}px; font-weight:700; background:transparent;")
         bar.addWidget(self.cov_lbl)
 
         alert_icon = QLabel("⚠")
-        alert_icon.setStyleSheet(f"color:{C.WARNING}; font-size:14px; background:transparent;")
+        alert_icon.setStyleSheet(f"color:{C.WARNING}; font-size:{sf(14)}px; background:transparent;")
         bar.addWidget(alert_icon)
         self.alert_spin = QDoubleSpinBox()
         self.alert_spin.setRange(0.0, 100.0)
         self.alert_spin.setValue(self._alert_threshold)
         self.alert_spin.setSuffix("%")
         self.alert_spin.setDecimals(0)
-        self.alert_spin.setFixedWidth(74)
-        self.alert_spin.setMinimumHeight(30)
+        self.alert_spin.setFixedWidth(sx(74))
+        self.alert_spin.setMinimumHeight(sx(30))
         self.alert_spin.setToolTip(tr("alert_spin_tip"))
         self.alert_spin.valueChanged.connect(self._on_alert_threshold_changed)
         bar.addWidget(self.alert_spin)
 
         self.alert_lbl = QLabel()
-        self.alert_lbl.setFixedWidth(52)
+        self.alert_lbl.setFixedWidth(sx(52))
         self.alert_lbl.setStyleSheet(
-            f"color:{C.DANGER}; font-size:12px; font-weight:700; background:transparent;")
+            f"color:{C.DANGER}; font-size:{sf(12)}px; font-weight:700; background:transparent;")
         bar.addWidget(self.alert_lbl)
 
         self.view_btn = QPushButton(tr("show_chart"))
-        self.view_btn.setFixedHeight(30)
+        self.view_btn.setFixedHeight(sx(30))
         self.view_btn.setStyleSheet(btn_ghost())
         self.view_btn.clicked.connect(self._toggle_view)
         bar.addWidget(self.view_btn)
 
         self.reset_bg_btn = QPushButton(tr("reset_bg"))
-        self.reset_bg_btn.setFixedHeight(30)
+        self.reset_bg_btn.setFixedHeight(sx(30))
         self.reset_bg_btn.setToolTip(tr("reset_bg_tip"))
         self.reset_bg_btn.setStyleSheet(btn_ghost())
         self.reset_bg_btn.clicked.connect(
@@ -175,16 +176,16 @@ class CameraTile(QFrame):
 
         self.sub_btn = QPushButton(tr("subtract"))
         self.sub_btn.setCheckable(True)
-        self.sub_btn.setFixedHeight(30)
-        self.sub_btn.setMinimumWidth(80)
+        self.sub_btn.setFixedHeight(sx(30))
+        self.sub_btn.setMinimumWidth(sx(80))
         self.sub_btn.setStyleSheet(btn_toggle())
         self.sub_btn.clicked.connect(self._on_sub_toggled)
         bar.addWidget(self.sub_btn)
 
         self.status_dot = QLabel("●")
-        self.status_dot.setFixedWidth(18)
+        self.status_dot.setFixedWidth(sx(18))
         self.status_dot.setStyleSheet(
-            f"color:{C.TEXT_FAINT}; font-size:16px; background:transparent;")
+            f"color:{C.TEXT_FAINT}; font-size:{sf(16)}px; background:transparent;")
         self.status_dot.setToolTip(tr("status_disconnected"))
         bar.addWidget(self.status_dot)
 
@@ -193,21 +194,21 @@ class CameraTile(QFrame):
         # ── video area ──
         self.img_container = QWidget()
         self.img_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.img_container.setMinimumHeight(140)
+        self.img_container.setMinimumHeight(sx(140))
         self.img_container.setStyleSheet("background:#05070c; border-radius:8px;")
 
         self.video_lbl = QLabel(self.img_container)
         self.video_lbl.setAlignment(Qt.AlignCenter)
         self.video_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.video_lbl.setStyleSheet(
-            f"background:transparent; color:{C.TEXT_FAINT}; font-size:14px;")
+            f"background:transparent; color:{C.TEXT_FAINT}; font-size:{sf(14)}px;")
         self.video_lbl.setText(tr("waiting_conn"))
 
         self.diff_lbl = QLabel(self.img_container)
         self.diff_lbl.setAlignment(Qt.AlignCenter)
         self.diff_lbl.setStyleSheet(
             f"background:#0a1020; border:1px solid {C.BORDER_HL};"
-            f" border-radius:5px; color:{C.TEXT_FAINT}; font-size:11px;")
+            f" border-radius:{sx(5)}px; color:{C.TEXT_FAINT}; font-size:{sf(11)}px;")
         self.diff_lbl.setText(tr("diff"))
         self.diff_lbl.setVisible(False)
 
@@ -349,13 +350,13 @@ class CameraTile(QFrame):
 
         self._conn_state = "streaming"
         self.status_dot.setStyleSheet(
-            f"color:{C.SUCCESS}; font-size:16px; background:transparent;")
+            f"color:{C.SUCCESS}; font-size:{sf(16)}px; background:transparent;")
         self.status_dot.setToolTip(tr("status_streaming"))
 
     def set_status(self, text: str, colour: str) -> None:
         """Show a transient state (connecting / reconnecting / error) on the dot."""
         self.status_dot.setStyleSheet(
-            f"color:{colour}; font-size:16px; background:transparent;")
+            f"color:{colour}; font-size:{sf(16)}px; background:transparent;")
         self.status_dot.setToolTip(text)
 
     def set_disconnected(self) -> None:
@@ -371,7 +372,7 @@ class CameraTile(QFrame):
         self.cov_lbl.setText("--")
         self.alert_lbl.setText("")
         self.status_dot.setStyleSheet(
-            f"color:{C.DANGER}; font-size:16px; background:transparent;")
+            f"color:{C.DANGER}; font-size:{sf(16)}px; background:transparent;")
         self.status_dot.setToolTip(tr("status_stopped"))
 
     # ── alert flashing ────────────────────────────────────────

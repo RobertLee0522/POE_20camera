@@ -39,6 +39,7 @@ from ..settings import Settings
 from .camera_tile import CameraTile
 from .compact_card import CompactCameraCard
 from .i18n import get_language, set_language, toggle_language, tr
+from .scaling import screen_size, sf, sx
 from .theme import (
     C, Card, app_stylesheet, btn_danger, btn_ghost, btn_primary, btn_success,
     btn_toggle, hline, key_label, value_label,
@@ -69,7 +70,10 @@ class MainWindow(QMainWindow):
         self._descriptors: List[CameraDescriptor] = []
 
         self.setWindowTitle(tr("win_title", n=self.max_cameras))
-        self.resize(1920, 1080)
+        # Restore-size when un-maximized: the actual screen's available
+        # area, not a hardcoded 1920x1080 that may not fit the display the
+        # app happens to open on.
+        self.resize(*screen_size())
         self.setStyleSheet(app_stylesheet())
 
         self._build_ui()
@@ -95,7 +99,8 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_sidebar())
         splitter.addWidget(self._build_camera_area())
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([340, 1580])
+        sw, _ = screen_size()
+        splitter.setSizes([sx(340), max(sx(1580), sw - sx(340))])
         outer.addWidget(splitter)
 
         self.setStatusBar(QStatusBar())
@@ -109,18 +114,18 @@ class MainWindow(QMainWindow):
     def _build_sidebar(self) -> QWidget:
         inner = QWidget()
         lay = QVBoxLayout(inner)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(12)
+        lay.setContentsMargins(sx(12), sx(12), sx(12), sx(12))
+        lay.setSpacing(sx(12))
 
         # language toggle
         top = QHBoxLayout()
         title = QLabel("POE · Aravis")
         title.setStyleSheet(
-            f"color:{C.TEXT}; font-size:15px; font-weight:700; background:transparent;")
+            f"color:{C.TEXT}; font-size:{sf(15)}px; font-weight:700; background:transparent;")
         top.addWidget(title)
         top.addStretch()
         self.lang_btn = QPushButton(tr("lang_btn"))
-        self.lang_btn.setFixedSize(66, 30)
+        self.lang_btn.setFixedSize(sx(66), sx(30))
         self.lang_btn.setToolTip(tr("lang_tip"))
         self.lang_btn.setStyleSheet(btn_ghost())
         self.lang_btn.clicked.connect(self._toggle_language)
@@ -138,15 +143,15 @@ class MainWindow(QMainWindow):
         scroll.setObjectName("Sidebar")
         scroll.setWidget(inner)
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(348)
+        scroll.setFixedWidth(sx(348))
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         return scroll
 
     def _build_hw_card(self) -> Card:
         self.hw_card = Card(tr("hw_monitor"), "🖥")
         grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
+        grid.setHorizontalSpacing(sx(10))
+        grid.setVerticalSpacing(sx(6))
 
         self.cpu_val  = value_label("–")
         self.ram_val  = value_label("–")
@@ -169,7 +174,7 @@ class MainWindow(QMainWindow):
         self.ctrl_card = Card(tr("cam_control"), "📷")
 
         self.refresh_btn = QPushButton(tr("refresh_dev"))
-        self.refresh_btn.setMinimumHeight(34)
+        self.refresh_btn.setMinimumHeight(sx(34))
         self.refresh_btn.setStyleSheet(btn_ghost())
         self.refresh_btn.clicked.connect(self.refresh_devices)
         self.ctrl_card.add(self.refresh_btn)
@@ -196,13 +201,13 @@ class MainWindow(QMainWindow):
         self.ctrl_card.add_layout(mode_row)
 
         self.start_all_btn = QPushButton(tr("start_all"))
-        self.start_all_btn.setMinimumHeight(36)
+        self.start_all_btn.setMinimumHeight(sx(36))
         self.start_all_btn.setStyleSheet(btn_success())
         self.start_all_btn.clicked.connect(self.start_all)
         self.ctrl_card.add(self.start_all_btn)
 
         self.stop_all_btn = QPushButton(tr("stop_all"))
-        self.stop_all_btn.setMinimumHeight(36)
+        self.stop_all_btn.setMinimumHeight(sx(36))
         self.stop_all_btn.setStyleSheet(btn_danger())
         self.stop_all_btn.clicked.connect(self.stop_all)
         self.ctrl_card.add(self.stop_all_btn)
@@ -216,7 +221,7 @@ class MainWindow(QMainWindow):
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(self._settings.target_fps)
-        self.fps_spin.setMinimumHeight(30)
+        self.fps_spin.setMinimumHeight(sx(30))
         self.fps_spin.valueChanged.connect(self.service.set_target_fps)
         self.param_card.add(self.fps_spin)
 
@@ -227,7 +232,7 @@ class MainWindow(QMainWindow):
         self.thresh_slider.setRange(1, 100)
         self.thresh_slider.setValue(self._settings.difference_threshold)
         self.thresh_val = value_label(str(self._settings.difference_threshold))
-        self.thresh_val.setFixedWidth(34)
+        self.thresh_val.setFixedWidth(sx(34))
         self.thresh_slider.valueChanged.connect(self._on_threshold_changed)
         th_row.addWidget(self.thresh_slider, 1)
         th_row.addWidget(self.thresh_val)
@@ -235,13 +240,13 @@ class MainWindow(QMainWindow):
 
         self.sub_all_btn = QPushButton(tr("sub_all_off"))
         self.sub_all_btn.setCheckable(True)
-        self.sub_all_btn.setMinimumHeight(34)
+        self.sub_all_btn.setMinimumHeight(sx(34))
         self.sub_all_btn.setStyleSheet(btn_toggle())
         self.sub_all_btn.clicked.connect(self._toggle_all_subtraction)
         self.param_card.add(self.sub_all_btn)
 
         self.reset_all_bg_btn = QPushButton(tr("reset_all_bg"))
-        self.reset_all_bg_btn.setMinimumHeight(34)
+        self.reset_all_bg_btn.setMinimumHeight(sx(34))
         self.reset_all_bg_btn.setToolTip(tr("reset_all_bg_tip"))
         self.reset_all_bg_btn.setStyleSheet(btn_ghost())
         self.reset_all_bg_btn.clicked.connect(self.service.reset_all_backgrounds)
@@ -257,11 +262,11 @@ class MainWindow(QMainWindow):
         self.global_alert_spin.setValue(self._settings.alert_threshold_percent)
         self.global_alert_spin.setSuffix("%")
         self.global_alert_spin.setDecimals(1)
-        self.global_alert_spin.setMinimumHeight(30)
+        self.global_alert_spin.setMinimumHeight(sx(30))
         self.global_alert_spin.setToolTip(tr("global_alert_tip"))
         self.apply_alert_btn = QPushButton(tr("apply_all"))
-        self.apply_alert_btn.setFixedWidth(104)
-        self.apply_alert_btn.setMinimumHeight(30)
+        self.apply_alert_btn.setFixedWidth(sx(104))
+        self.apply_alert_btn.setMinimumHeight(sx(30))
         self.apply_alert_btn.setStyleSheet(btn_ghost())
         self.apply_alert_btn.clicked.connect(
             lambda: self._apply_global_alert(self.global_alert_spin.value()))
@@ -275,8 +280,8 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        form.setHorizontalSpacing(8)
-        form.setVerticalSpacing(7)
+        form.setHorizontalSpacing(sx(8))
+        form.setVerticalSpacing(sx(7))
         form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self.exp_key  = key_label(tr("exposure"))
@@ -288,20 +293,20 @@ class MainWindow(QMainWindow):
         self.exp_spin.setDecimals(1)
         self.exp_spin.setSingleStep(1000.0)
         self.exp_spin.setValue(20000.0)
-        self.exp_spin.setMinimumHeight(28)
+        self.exp_spin.setMinimumHeight(sx(28))
 
         self.gain_spin = QDoubleSpinBox()
         self.gain_spin.setRange(0.0, 48.0)
         self.gain_spin.setDecimals(2)
         self.gain_spin.setSingleStep(0.5)
-        self.gain_spin.setMinimumHeight(28)
+        self.gain_spin.setMinimumHeight(sx(28))
 
         self.fr_spin = QDoubleSpinBox()
         self.fr_spin.setRange(0.1, 200.0)
         self.fr_spin.setDecimals(2)
         self.fr_spin.setSingleStep(1.0)
         self.fr_spin.setValue(15.0)
-        self.fr_spin.setMinimumHeight(28)
+        self.fr_spin.setMinimumHeight(sx(28))
 
         form.addRow(self.exp_key,  self.exp_spin)
         form.addRow(self.gain_key, self.gain_spin)
@@ -309,13 +314,13 @@ class MainWindow(QMainWindow):
         self.cam_param_card.add_layout(form)
 
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
+        btn_row.setSpacing(sx(6))
         self.get_param_btn = QPushButton(tr("get_param"))
-        self.get_param_btn.setMinimumHeight(30)
+        self.get_param_btn.setMinimumHeight(sx(30))
         self.get_param_btn.setStyleSheet(btn_ghost())
         self.get_param_btn.clicked.connect(self._get_cam_params)
         self.set_param_btn = QPushButton(tr("set_param"))
-        self.set_param_btn.setMinimumHeight(30)
+        self.set_param_btn.setMinimumHeight(sx(30))
         self.set_param_btn.setStyleSheet(btn_primary())
         self.set_param_btn.clicked.connect(self._set_cam_params)
         btn_row.addWidget(self.get_param_btn)
@@ -325,18 +330,18 @@ class MainWindow(QMainWindow):
         self.cam_param_status = QLabel(tr("param_ready"))
         self.cam_param_status.setAlignment(Qt.AlignCenter)
         self.cam_param_status.setStyleSheet(
-            f"color:{C.TEXT_FAINT}; font-size:11px; background:transparent;")
+            f"color:{C.TEXT_FAINT}; font-size:{sf(11)}px; background:transparent;")
         self.cam_param_card.add(self.cam_param_status)
         return self.cam_param_card
 
     def _build_devices_card(self) -> Card:
         self.dev_card = Card(tr("detected_dev"), "📋")
         self.dev_list = QListWidget()
-        self.dev_list.setMinimumHeight(140)
+        self.dev_list.setMinimumHeight(sx(140))
         self.dev_list.setStyleSheet(
             f"QListWidget {{ background:{C.SURFACE_2}; border:1px solid {C.BORDER};"
-            f" border-radius:8px; font-size:12px; }}"
-            f" QListWidget::item {{ padding:4px 6px; }}"
+            f" border-radius:{sx(8)}px; font-size:{sf(12)}px; }}"
+            f" QListWidget::item {{ padding:{sx(4)}px {sx(6)}px; }}"
             f" QListWidget::item:selected {{ background:{C.ACCENT}; }}")
         self.dev_card.add(self.dev_list)
         return self.dev_card
@@ -346,7 +351,7 @@ class MainWindow(QMainWindow):
     def _build_camera_area(self) -> QWidget:
         container = QWidget()
         lay = QVBoxLayout(container)
-        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setContentsMargins(sx(8), sx(8), sx(8), sx(8))
         lay.setSpacing(0)
 
         self.tabs = QTabWidget()
@@ -354,17 +359,17 @@ class MainWindow(QMainWindow):
             QTabWidget::pane {{
                 border: 1px solid {C.BORDER};
                 background: {C.BG_ELEV};
-                border-radius: 10px;
+                border-radius: {sx(10)}px;
             }}
             QTabBar::tab {{
                 background: {C.SURFACE};
                 color: {C.TEXT_DIM};
                 border: 1px solid {C.BORDER};
-                padding: 8px 14px;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                font-size: 12px;
-                min-width: 78px;
+                padding: {sx(8)}px {sx(14)}px;
+                border-top-left-radius: {sx(8)}px;
+                border-top-right-radius: {sx(8)}px;
+                font-size: {sf(12)}px;
+                min-width: {sx(78)}px;
             }}
             QTabBar::tab:selected {{
                 background: {C.SURFACE_2};
@@ -378,8 +383,8 @@ class MainWindow(QMainWindow):
         for page in range(self.page_count):
             page_widget = QWidget()
             page_layout = QHBoxLayout(page_widget)
-            page_layout.setContentsMargins(8, 8, 8, 8)
-            page_layout.setSpacing(8)
+            page_layout.setContentsMargins(sx(8), sx(8), sx(8), sx(8))
+            page_layout.setSpacing(sx(8))
 
             for j in range(self.per_page):
                 slot_id = page * self.per_page + j
@@ -402,7 +407,7 @@ class MainWindow(QMainWindow):
 
         self.overview_btn = QPushButton(tr("overview"))
         self.overview_btn.setCheckable(True)
-        self.overview_btn.setFixedHeight(28)
+        self.overview_btn.setFixedHeight(sx(28))
         self.overview_btn.setStyleSheet(btn_ghost())
         self.overview_btn.clicked.connect(self._toggle_overview)
         self.tabs.setCornerWidget(self.overview_btn, Qt.TopRightCorner)
@@ -412,24 +417,24 @@ class MainWindow(QMainWindow):
         self.overview = QWidget()
         self.overview.setVisible(False)
         ov_root = QVBoxLayout(self.overview)
-        ov_root.setContentsMargins(6, 6, 6, 6)
-        ov_root.setSpacing(6)
+        ov_root.setContentsMargins(sx(6), sx(6), sx(6), sx(6))
+        ov_root.setSpacing(sx(6))
 
         header = QHBoxLayout()
         self.ov_title = QLabel(tr("overview_title"))
         self.ov_title.setStyleSheet(
-            f"color:{C.TEXT}; font-size:14px; font-weight:700; background:transparent;")
+            f"color:{C.TEXT}; font-size:{sf(14)}px; font-weight:700; background:transparent;")
         header.addWidget(self.ov_title)
         header.addStretch()
         self.back_btn = QPushButton(tr("back_to_tabs"))
-        self.back_btn.setFixedHeight(28)
+        self.back_btn.setFixedHeight(sx(28))
         self.back_btn.setStyleSheet(btn_ghost())
         self.back_btn.clicked.connect(lambda: self.overview_btn.click())
         header.addWidget(self.back_btn)
         ov_root.addLayout(header)
 
         grid = QGridLayout()
-        grid.setSpacing(6)
+        grid.setSpacing(sx(6))
         for idx in range(self.max_cameras):
             card = CompactCameraCard(
                 idx, label=f"Cam {idx + 1:02d}",
@@ -641,7 +646,7 @@ class MainWindow(QMainWindow):
     def _param_status(self, message: str, colour: str) -> None:
         self.cam_param_status.setText(message)
         self.cam_param_status.setStyleSheet(
-            f"color:{colour}; font-size:11px; background:transparent;")
+            f"color:{colour}; font-size:{sf(11)}px; background:transparent;")
 
     # ── misc updates ──────────────────────────────────────────
 
